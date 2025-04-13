@@ -777,10 +777,7 @@ def run_gui_imgui_bundle():
                 if gui_state["progress"] < 1.0 and gui_state["progress"] >= 0: # Didn't finish cleanly?
                      gui_state["log_messages"].append("Warning: Processing ended prematurely.")
 
-
-        # Build the ImGui window
-        imgui.set_next_window_size(ImVec2(600, 550), cond=imgui.Cond_.first_use_ever) #imgui_bundle API
-        imgui.begin("Sector Heightmap Generator")
+        # NO imgui.set_next_window_size or imgui.begin here - draw directly on viewport
 
         # --- Input Folder ---
         imgui.push_item_width(-200) # Make text input fill width minus button
@@ -834,7 +831,7 @@ def run_gui_imgui_bundle():
 
         imgui.separator()
 
-# --- Action Button & Progress ---
+        # --- Action Button & Progress ---
 
         # Evaluate the condition ONCE per frame before the button
         button_needs_disabling = gui_state["is_processing"]
@@ -908,7 +905,7 @@ def run_gui_imgui_bundle():
              imgui.set_scroll_here_y(1.0)
         imgui.end_child()
 
-        imgui.end() # End main window
+        # NO imgui.end() here
 
     # Use hello_imgui runner
     runner_params = hello_imgui.RunnerParams()
@@ -955,7 +952,7 @@ def run_gui_pyimgui():
 
         imgui.new_frame()
 
-        # --- GUI Definition (Adopt similar safe structure for pyimgui if needed) ---
+        # --- GUI Definition ---
         global gui_state
 
         # Check for updates from processing thread
@@ -969,10 +966,7 @@ def run_gui_pyimgui():
                 if gui_state["progress"] < 1.0 and gui_state["progress"] >= 0:
                      gui_state["log_messages"].append("Warning: Processing ended prematurely.")
 
-
-        # Build the ImGui window
-        imgui.set_next_window_size(600, 550, condition=imgui.FIRST_USE_EVER)
-        imgui.begin("Sector Heightmap Generator")
+        # NO imgui.set_next_window_size or imgui.begin here
 
         # --- Input Folder ---
         imgui.push_item_width(-200)
@@ -1005,82 +999,90 @@ def run_gui_pyimgui():
         overlap_val = [gui_state["sector_overlap"]]
         changed = imgui.input_int("Sector Overlap", overlap_val)
         if changed: gui_state["sector_overlap"] = max(0, overlap_val[0])
+        # Tooltip for pyimgui might need to be placed after item if is_item_hovered used alone
+        if imgui.is_item_hovered(): imgui.set_tooltip("Number of pixels sectors overlap...")
+
 
         blend_val = [gui_state["boundary_blend_size"]]
         changed = imgui.input_int("Boundary Blend Size", blend_val)
         if changed: gui_state["boundary_blend_size"] = max(0, blend_val[0])
+        if imgui.is_item_hovered(): imgui.set_tooltip("Size of the feathered edge...")
+
 
         scale_val = [gui_state["height_scale_factor"]]
         changed = imgui.input_float("Height Scale Factor", scale_val, 0.1, 1.0, "%.2f")
         if changed:
             gui_state["height_scale_factor"] = scale_val[0]
             if gui_state["height_scale_factor"] <= 0: gui_state["height_scale_factor"] = 0.01
-        imgui.pop_item_width()
+        if imgui.is_item_hovered(): imgui.set_tooltip("Divisor for the raw uint16 height offset value...")
 
-        # Tooltips might need adjustment for pyimgui
-        # Example: Check hover after the InputFloat call
-        # if imgui.is_item_hovered(): imgui.set_tooltip("Divisor...")
+        imgui.pop_item_width()
 
 
         imgui.separator()
 
-# --- Action Button & Progress ---
+        # --- Action Button & Progress (Applying safer structure to pyimgui too) ---
 
         # Evaluate the condition ONCE per frame before the button
-        button_needs_disabling = gui_state["is_processing"]
+        button_needs_disabling_pyi = gui_state["is_processing"]
 
-        # Use the public API imgui.begin_disabled() / imgui.end_disabled()
-        if button_needs_disabling:
-            # Begin the disabled state block
-            imgui.begin_disabled(True) # Pass True to disable
-            # Push the style modification *inside* the disabled block
-            imgui.push_style_var(imgui.StyleVar_.alpha, imgui.get_style().alpha * 0.5)
+        # Conditionally push style/flags *just before* the button
+        # Using try-except for potentially missing internal methods/different enums
+        # Or use begin_disabled if available in the target pyimgui version
+        use_begin_disabled_pyi = hasattr(imgui, "begin_disabled")
+        if button_needs_disabling_pyi:
+            if use_begin_disabled_pyi:
+                imgui.begin_disabled(True)
+            else:
+                try: # Fallback to internal flags
+                    imgui.internal.push_item_flag(imgui.ITEM_DISABLED, True)
+                except AttributeError: pass # Ignore if not available
+            # Still apply alpha for visual cue
+            imgui.push_style_var(imgui.STYLE_ALPHA, imgui.get_style().alpha * 0.5)
 
-        # Render the button widget.
-        # It will be visually disabled and non-interactive if begin_disabled(True) was called.
-        button_clicked = imgui.button("Generate Heightmap")
+        # Render the button widget AND store its clicked state
+        button_clicked_pyi = imgui.button("Generate Heightmap")
 
-        # End the disabled state block *if it was started*
-        if button_needs_disabling:
-            # Pop the style *before* ending the disabled block (LIFO)
-            imgui.pop_style_var()
-            # End the disabled state block
-            imgui.end_disabled()
+        # Conditionally pop style/flags *immediately after* the button
+        if button_needs_disabling_pyi:
+             # Pop the style variable first (LIFO)
+             imgui.pop_style_var()
+             # End disabled block or pop flag
+             if use_begin_disabled_pyi:
+                 imgui.end_disabled()
+             else:
+                 try: # Pop flag if internal push was used
+                     imgui.internal.pop_item_flag()
+                 except AttributeError: pass # Ignore if not available/needed
 
-        # Now, handle the button click *after* the stack/state is potentially restored
-        # Note: button_clicked should be False if the button was disabled.
-        if button_clicked:
-            # Only start if not already processing
-            if not gui_state["is_processing"]:
-                # Start processing in a separate thread
-                gui_state["is_processing"] = True # State change happens here
-                gui_state["progress"] = 0.0
-                gui_state["log_messages"] = ["Starting processing..."] # Clear log
-
-                # Prepare config dict
-                current_config = {
-                    'input_dir': gui_state["input_dir"],
-                    'output_filename': gui_state["output_filename"],
-                    'apply_boundary_smoothing': gui_state["apply_boundary_smoothing"],
-                    'sector_overlap': gui_state["sector_overlap"],
-                    'boundary_blend_size': gui_state["boundary_blend_size"],
-                    'height_scale_factor': gui_state["height_scale_factor"],
-                   }
-
-                # Clear queues before starting
-                while not gui_state["log_queue"].empty(): gui_state["log_queue"].get()
-                while not gui_state["progress_queue"].empty(): gui_state["progress_queue"].get()
-
-                gui_state["processing_thread"] = threading.Thread(
-                    target=generate_heightmap,
-                    args=(current_config, gui_state["log_queue"], gui_state["progress_queue"]),
-                    daemon=True
-                )
-                gui_state["processing_thread"].start()
+        # Now, handle the button click *after* the stack is potentially restored
+        if button_clicked_pyi:
+             # Only start if not already processing
+             if not gui_state["is_processing"]:
+                 # Start processing thread (same logic as imgui-bundle version)
+                 gui_state["is_processing"] = True
+                 gui_state["progress"] = 0.0
+                 gui_state["log_messages"] = ["Starting processing..."]
+                 current_config = {
+                     'input_dir': gui_state["input_dir"],
+                     'output_filename': gui_state["output_filename"],
+                     'apply_boundary_smoothing': gui_state["apply_boundary_smoothing"],
+                     'sector_overlap': gui_state["sector_overlap"],
+                     'boundary_blend_size': gui_state["boundary_blend_size"],
+                     'height_scale_factor': gui_state["height_scale_factor"],
+                    }
+                 while not gui_state["log_queue"].empty(): gui_state["log_queue"].get()
+                 while not gui_state["progress_queue"].empty(): gui_state["progress_queue"].get()
+                 gui_state["processing_thread"] = threading.Thread(
+                     target=generate_heightmap,
+                     args=(current_config, gui_state["log_queue"], gui_state["progress_queue"]),
+                     daemon=True
+                 )
+                 gui_state["processing_thread"].start()
 
         # Render the progress bar (always visible)
         imgui.same_line()
-        imgui.progress_bar(gui_state["progress"], size_arg=ImVec2(-1, 0)) # Auto width
+        imgui.progress_bar(gui_state["progress"], size=(-1, 0)) # pyimgui often uses tuple for size
 
         # --- End of Action Button & Progress Section ---
 
@@ -1092,11 +1094,15 @@ def run_gui_pyimgui():
         # pyimgui often uses width, height, border args
         imgui.begin_child("Log", -1, log_height, border=True) # w=-1 means auto
         imgui.text_unformatted("\n".join(gui_state["log_messages"]))
+        # Check for different scroll functions in older pyimgui if needed
         if imgui.get_scroll_y() >= imgui.get_scroll_max_y():
-             imgui.set_scroll_here(1.0) # pyimgui might use set_scroll_here() or set_scroll_here_y()
+             try:
+                 imgui.set_scroll_here_y(1.0)
+             except AttributeError:
+                 imgui.set_scroll_here(1.0) # Fallback for older versions
         imgui.end_child()
 
-        imgui.end() # End main window
+        # NO imgui.end() here
 
         # --- Rendering ---
         gl.glClearColor(0.1, 0.1, 0.1, 1) # Background color
