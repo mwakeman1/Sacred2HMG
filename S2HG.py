@@ -10,6 +10,7 @@ import traceback
 import threading
 import time
 from queue import Queue  # For thread-safe communication
+import zipfile         # <--- Added import
 
 # --- ImGui / GUI specific imports ---
 # Use tkinter for the folder dialog as it's often built-in
@@ -105,9 +106,9 @@ def create_weight_map(sector_h, sector_w, blend_size):
         weight_map[center_start:center_end_y, center_start:center_end_x] = 1.0
     return weight_map
 
-
-def process_sector_base_offset(filepath, expected_width, expected_height, log_queue):
-    """Reads int16 base (Hdr@2) and uint16 offsets (Entry@6) from the .sector file."""
+# --- MODIFIED Function Signature and Internal Logic ---
+def process_sector_base_offset(sector_content_bytes, sector_filename_in_zip, expected_width, expected_height, log_queue):
+    """Reads int16 base (Hdr@2) and uint16 offsets (Entry@6) from sector file content bytes."""
     height_offsets = []
     base_h = 0
     header_bytes = None
@@ -115,40 +116,51 @@ def process_sector_base_offset(filepath, expected_width, expected_height, log_qu
     expected_vertices = expected_width * expected_height
     width = None
     height = None
-    filename_short = os.path.basename(filepath)
+    # Use the filename from within the zip for logging
+    filename_short = os.path.basename(sector_filename_in_zip)
 
     try:
-        with open(filepath, 'rb') as f:
-            content_to_scan = f.read()
-            file_size = len(content_to_scan)
-            if not content_to_scan:
-                log_queue.put(f" W: Skipping empty file {filename_short}")
-                return None, None, None, None, None, None
+        # --- Operate directly on the passed bytes ---
+        content_to_scan = sector_content_bytes
+        file_size = len(content_to_scan)
+        if not content_to_scan:
+            log_queue.put(f" W: Skipping empty sector content for {filename_short}")
+            return None, None, None, None, None, None
 
-            search_start_offset = 0
-            found_valid_context = False
-            while search_start_offset < file_size:
-                current_marker_offset = content_to_scan.find(START_MARKER, search_start_offset)
-                if current_marker_offset == -1:
-                    break # No more markers
+        search_start_offset = 0
+        found_valid_context = False
+        while search_start_offset < file_size:
+            current_marker_offset = content_to_scan.find(START_MARKER, search_start_offset)
+            if current_marker_offset == -1:
+                break # No more markers
 
-                potential_data_start = current_marker_offset + len(START_MARKER) + BYTES_TO_SKIP_AFTER_MARKER
-                potential_header_start = current_marker_offset + len(START_MARKER)
+            potential_data_start = current_marker_offset + len(START_MARKER) + BYTES_TO_SKIP_AFTER_MARKER
+            potential_header_start = current_marker_offset + len(START_MARKER)
 
-                # Check if enough space for header and context check
-                if potential_data_start + (N_CONTEXT_CHECK * ENTRY_SIZE) <= file_size:
-                    context_valid = True
-                    for i in range(N_CONTEXT_CHECK):
-                        entry_offset = potential_data_start + (i * ENTRY_SIZE)
-                        entry_bytes = content_to_scan[entry_offset : entry_offset + ENTRY_SIZE]
-                        # Basic check: length and expected zero bytes
-                        if len(entry_bytes) < ENTRY_SIZE or not all(entry_bytes[z] == 0x00 for z in EXPECTED_ZERO_BYTES_OFFSETS):
-                            context_valid = False
-                            break # This context is not valid
+            # Check if enough space for header and context check
+            if potential_data_start + (N_CONTEXT_CHECK * ENTRY_SIZE) <= file_size:
+                context_valid = True
+                for i in range(N_CONTEXT_CHECK):
+                    entry_offset = potential_data_start + (i * ENTRY_SIZE)
+                    # Check bounds before slicing
+                    if entry_offset + ENTRY_SIZE > file_size:
+                         context_valid = False
+                         break
+                    entry_bytes = content_to_scan[entry_offset : entry_offset + ENTRY_SIZE]
+                    # Basic check: length and expected zero bytes
+                    # Ensure entry_bytes has expected length before indexing
+                    if len(entry_bytes) < ENTRY_SIZE or not all(entry_bytes[z] == 0x00 for z in EXPECTED_ZERO_BYTES_OFFSETS):
+                        context_valid = False
+                        break # This context is not valid
 
-                    if context_valid:
-                        # Context seems valid, try reading the base height from the header
-                        try:
+                if context_valid:
+                    # Context seems valid, try reading the base height from the header
+                    try:
+                        # Check bounds before slicing
+                        if potential_header_start + BYTES_TO_SKIP_AFTER_MARKER > file_size:
+                            log_queue.put(f" W:{filename_short} Not enough data for header after marker.")
+                            context_valid = False # Treat as invalid context
+                        else:
                             header_bytes = content_to_scan[potential_header_start : potential_header_start + BYTES_TO_SKIP_AFTER_MARKER]
                             if len(header_bytes) >= BASE_H_OFFSET_IN_HEADER + struct.calcsize(BASE_H_FORMAT):
                                 base_h, = struct.unpack_from(BASE_H_FORMAT, header_bytes, BASE_H_OFFSET_IN_HEADER)
@@ -161,59 +173,64 @@ def process_sector_base_offset(filepath, expected_width, expected_height, log_qu
                                 log_queue.put(f" W:{filename_short} Header size insufficient after marker.")
                                 base_h = 0
                                 header_bytes = None
-                                # Continue searching for another marker
-                        except Exception as e:
-                            log_queue.put(f" W:{filename_short} Error reading header base H: {e}")
-                            base_h = 0
-                            header_bytes = None
-                            # Continue searching
+                                # Continue searching for another marker (handled by loop)
+                    except Exception as e:
+                        log_queue.put(f" W:{filename_short} Error reading header base H: {e}")
+                        base_h = 0
+                        header_bytes = None
+                        # Continue searching (handled by loop)
 
-                # Move search start past the current marker to find the next one
-                search_start_offset = current_marker_offset + 1
+            # Move search start past the current marker to find the next one
+            search_start_offset = current_marker_offset + 1
+        # --- End of search loop ---
 
-            if not found_valid_context:
-                log_queue.put(f" W: No valid data block found in {filename_short}.")
+        if not found_valid_context:
+            log_queue.put(f" W: No valid data block found in {filename_short}.")
+            return None, None, None, None, None, None
+
+        # --- Read entries directly from the byte content ---
+        bytes_needed = expected_vertices * ENTRY_SIZE
+        data_block_bytes = content_to_scan[data_start_offset:] # Slice the data part
+
+        if len(data_block_bytes) < bytes_needed:
+            log_queue.put(f" W:{filename_short} Not enough data for {expected_vertices} vertices after marker (found {len(data_block_bytes)} bytes, need {bytes_needed}). Skipping.")
+            return None, None, None, None, None, None
+
+        for i in range(expected_vertices):
+            entry_offset_in_data = i * ENTRY_SIZE
+            # Slice the specific entry from the data block
+            entry_bytes = data_block_bytes[entry_offset_in_data : entry_offset_in_data + ENTRY_SIZE]
+
+            # len check should not be needed due to overall check above, but belt-and-suspenders:
+            if len(entry_bytes) < ENTRY_SIZE:
+                 log_queue.put(f" E:{filename_short} Unexpected short read at vertex {i+1}/{expected_vertices} (internal error).")
+                 return None, None, None, None, None, None
+            try:
+                # Check zero bytes again for this specific entry for robustness
+                if not all(entry_bytes[z] == 0x00 for z in EXPECTED_ZERO_BYTES_OFFSETS):
+                     log_queue.put(f" W:{filename_short} Entry {i} failed zero byte check. Using offset anyway.") # Or skip?
+                h_val, = struct.unpack_from(HEIGHT_FORMAT, entry_bytes, HEIGHT_OFFSET_IN_ENTRY)
+                height_offsets.append(h_val)
+            except struct.error as e:
+                log_queue.put(f" W:{filename_short} Struct error unpacking uint16 offset at vertex {i}: {e}")
+                # Decide handling: return error, or append a default (like 0 or NaN)? Let's error out.
                 return None, None, None, None, None, None
 
-            # Seek to the start of the data block and read entries
-            f.seek(data_start_offset)
-            bytes_needed = expected_vertices * ENTRY_SIZE
-            if f.tell() + bytes_needed > file_size:
-                log_queue.put(f" W:{filename_short} Not enough data for {expected_vertices} vertices after marker. Skipping.")
-                return None, None, None, None, None, None
+        if len(height_offsets) != expected_vertices:
+            # This case should theoretically not be reached due to earlier checks
+            log_queue.put(f" E:{filename_short} Read count mismatch ({len(height_offsets)} vs {expected_vertices}).")
+            return None, None, None, None, None, None
 
-            for i in range(expected_vertices):
-                entry_bytes = f.read(ENTRY_SIZE)
-                if len(entry_bytes) < ENTRY_SIZE:
-                    log_queue.put(f" E:{filename_short} Unexpected EOF at vertex {i+1}/{expected_vertices}.")
-                    return None, None, None, None, None, None
-                try:
-                    # Check zero bytes again for this specific entry for robustness
-                    if not all(entry_bytes[z] == 0x00 for z in EXPECTED_ZERO_BYTES_OFFSETS):
-                         log_queue.put(f" W:{filename_short} Entry {i} failed zero byte check. Using offset anyway.") # Or skip?
-                    h_val, = struct.unpack_from(HEIGHT_FORMAT, entry_bytes, HEIGHT_OFFSET_IN_ENTRY)
-                    height_offsets.append(h_val)
-                except struct.error as e:
-                    log_queue.put(f" W:{filename_short} Struct error unpacking uint16 offset at vertex {i}: {e}")
-                    # Decide handling: return error, or append a default (like 0 or NaN)? Let's error out.
-                    return None, None, None, None, None, None
+        width = expected_width
+        height = expected_height
+        return height_offsets, width, height, base_h, header_bytes, data_start_offset # data_start_offset is relative to original bytes
 
-            if len(height_offsets) != expected_vertices:
-                # This case should theoretically not be reached due to earlier checks
-                log_queue.put(f" E:{filename_short} Read count mismatch ({len(height_offsets)} vs {expected_vertices}).")
-                return None, None, None, None, None, None
-
-            width = expected_width
-            height = expected_height
-            return height_offsets, width, height, base_h, header_bytes, data_start_offset
-
-    except FileNotFoundError:
-        log_queue.put(f" Error: File not found {filepath}")
-        return None, None, None, None, None, None
     except Exception as e:
-        log_queue.put(f" Error processing {filepath}: {e}")
+        # Catch errors during byte processing
+        log_queue.put(f" Error processing sector content for {filename_short}: {e}")
         log_queue.put(traceback.format_exc())
         return None, None, None, None, None, None
+
 
 def correct_detile_sector(sector_offset_values, sector_width, sector_height, log_queue):
     """Detiling function using row-major indexing."""
@@ -333,15 +350,10 @@ def smooth_tile_boundaries(heightmap, tile_width, tile_height, log_queue):
 
     return smoothed
 
-# --- Main Processing Function (called by GUI) ---
+# --- MODIFIED Main Processing Function ---
 def generate_heightmap(config, log_queue, progress_queue):
     """
-    Processes sector files based on config and updates GUI via queues.
-
-    Args:
-        config (dict): Dictionary containing processing parameters.
-        log_queue (Queue): Queue to send log messages (strings) to the GUI.
-        progress_queue (Queue): Queue to send progress updates (floats 0.0-1.0) to the GUI.
+    Processes sector files found within ZIP archives based on config and updates GUI via queues.
     """
     try:
         input_dir = config['input_dir']
@@ -356,18 +368,17 @@ def generate_heightmap(config, log_queue, progress_queue):
             progress_queue.put(-1.0) # Indicate error
             return
 
-        # Ensure scale factor is not zero
+        # --- Parameter validation (keep as is) ---
         if height_scale_factor == 0:
              log_queue.put("Error: Height Scale Factor cannot be zero.")
              progress_queue.put(-1.0)
              return
-        # Ensure scale factor is float for division
         height_scale_factor = float(height_scale_factor)
+        # ---
 
+        output_file_path = os.path.join(input_dir, output_filename)
 
-        output_file_path = os.path.join(input_dir, output_filename) # Save in the input dir for simplicity
-
-        log_queue.put("--- Starting Heightmap Generation ---")
+        log_queue.put("--- Starting Heightmap Generation (from ZIPs) ---")
         log_queue.put(f"Input Folder: {input_dir}")
         log_queue.put(f"Output File: {output_filename}")
         log_queue.put(f"Apply Boundary Smoothing: {apply_boundary_smoothing}")
@@ -378,248 +389,218 @@ def generate_heightmap(config, log_queue, progress_queue):
         log_queue.put("Normalization: Min-Max")
         progress_queue.put(0.0)
 
-        all_sector_files = glob.glob(os.path.join(input_dir, '*.sector'))
-        # Filter out the potential output file itself if it exists and ends with .sector
-        sector_files = [f for f in all_sector_files if os.path.abspath(f) != os.path.abspath(output_file_path)]
-
-        log_queue.put(f"Found {len(sector_files)} sector files to process.")
-        if not sector_files:
-            log_queue.put("Error: No .sector files found in the specified directory.")
+        # --- Find ZIP files instead of .sector files ---
+        all_zip_files = glob.glob(os.path.join(input_dir, '*.zip'))
+        log_queue.put(f"Found {len(all_zip_files)} ZIP files to scan.")
+        if not all_zip_files:
+            log_queue.put("Error: No .zip files found in the specified directory.")
             progress_queue.put(-1.0) # Indicate error
             return
+        # ---
 
-        # --- Set Fixed Layout Size ---
         log_queue.put(f"Using fixed layout size: {LAYOUT_SECTOR_WIDTH} x {LAYOUT_SECTOR_HEIGHT}")
 
-        # --- Pass 1: Read Header Base and Entry Offsets ---
-        log_queue.put("--- Pass 1: Reading sector data ---")
+        # --- Pass 1: Read Header Base and Entry Offsets from sectors within Zips ---
+        log_queue.put("--- Pass 1: Reading sector data from ZIPs ---")
         sectors_data = {}
         all_coords = []
         processed_count = 0
-        total_files = len(sector_files)
-        for i, filepath in enumerate(sector_files):
-            filename = os.path.basename(filepath)
-            sx, sy = parse_filename(filename)
-            if sx is None or sy is None:
-                log_queue.put(f"  W: Skipping '{filename}', could not parse coordinates.")
-                continue
+        total_zips = len(all_zip_files)
 
-            # Use the fixed layout size
-            result = process_sector_base_offset(filepath, LAYOUT_SECTOR_WIDTH, LAYOUT_SECTOR_HEIGHT, log_queue)
+        # --- Iterate through ZIP files ---
+        for zip_idx, zip_filepath in enumerate(all_zip_files):
+            zip_filename = os.path.basename(zip_filepath)
+            log_queue.put(f" -> Processing ZIP: {zip_filename} ({zip_idx+1}/{total_zips})")
+            try:
+                with zipfile.ZipFile(zip_filepath, 'r') as zf:
+                    # Get names of all files within the zip
+                    member_names = zf.namelist()
+                    # Filter for .sector files
+                    sector_members = [
+                        name for name in member_names
+                        if name.lower().endswith('.sector')
+                        # Optionally add more filtering, e.g., ensure it's in root or specific dir
+                        # and not os.path.dirname(name) # Example: only root files
+                    ]
 
-            if result[0] is not None:
-                height_offsets, w, h, base_h, _, _ = result
-                if w != LAYOUT_SECTOR_WIDTH or h != LAYOUT_SECTOR_HEIGHT:
-                     log_queue.put(f" W: {filename} - dimensions mismatch ({w}x{h} vs expected {LAYOUT_SECTOR_WIDTH}x{LAYOUT_SECTOR_HEIGHT}). Skipping.")
-                     continue
+                    if not sector_members:
+                        log_queue.put(f"    No .sector files found in {zip_filename}")
+                        continue
 
-                # Detile the raw offsets
-                detiled_offsets_uint16 = correct_detile_sector(height_offsets, w, h, log_queue)
+                    # --- Iterate through .sector files found WITHIN the current zip ---
+                    for sector_name_in_zip in sector_members:
+                        filename_short = os.path.basename(sector_name_in_zip) # Get short name for parsing/logging
+                        sx, sy = parse_filename(filename_short)
+                        if sx is None or sy is None:
+                            log_queue.put(f"    W: Skipping '{filename_short}' in {zip_filename}, could not parse coordinates.")
+                            continue
 
-                if detiled_offsets_uint16 is not None:
-                    sectors_data[(sx, sy)] = {
-                        'detiled_offsets': detiled_offsets_uint16,
-                        'base_h': base_h,
-                        'width': w,
-                        'height': h
-                    }
-                    all_coords.append((sx, sy))
-                    processed_count += 1
-                else:
-                    log_queue.put(f"  W: Failed to detile {filename}. Skipping.")
-            # else: process_sector_base_offset already logged the error
+                        try:
+                            # Read the content of the sector file from the zip
+                            sector_bytes = zf.read(sector_name_in_zip)
 
-            progress_queue.put(0.3 * (i + 1) / total_files) # Pass 1 is ~30%
+                            # Call the MODIFIED processing function with BYTES
+                            result = process_sector_base_offset(
+                                sector_bytes,
+                                filename_short, # Pass the name for logging
+                                LAYOUT_SECTOR_WIDTH,
+                                LAYOUT_SECTOR_HEIGHT,
+                                log_queue
+                            )
 
-        log_queue.put(f"Finished Pass 1. Processed {processed_count} valid sectors.")
+                            if result[0] is not None:
+                                height_offsets, w, h, base_h, _, _ = result
+                                if w != LAYOUT_SECTOR_WIDTH or h != LAYOUT_SECTOR_HEIGHT:
+                                     log_queue.put(f"    W: {filename_short} in {zip_filename} - dimensions mismatch ({w}x{h}). Skipping.")
+                                     continue
+
+                                detiled_offsets_uint16 = correct_detile_sector(height_offsets, w, h, log_queue)
+
+                                if detiled_offsets_uint16 is not None:
+                                    log_queue.put(f"    OK: Processed {filename_short} from {zip_filename}")
+                                    sectors_data[(sx, sy)] = {
+                                        'detiled_offsets': detiled_offsets_uint16,
+                                        'base_h': base_h,
+                                        'width': w,
+                                        'height': h
+                                    }
+                                    all_coords.append((sx, sy))
+                                    processed_count += 1
+                                else:
+                                    log_queue.put(f"    W: Failed to detile {filename_short} from {zip_filename}. Skipping.")
+                            # else: process_sector_base_offset already logged the error for this sector
+
+                        except KeyError:
+                             log_queue.put(f"    E: Sector '{sector_name_in_zip}' not found in {zip_filename} (unexpected).")
+                        except Exception as sector_e:
+                             log_queue.put(f"    E: Error reading/processing sector '{sector_name_in_zip}' from {zip_filename}: {sector_e}")
+                             log_queue.put(traceback.format_exc())
+                    # --- End loop over sectors in zip ---
+
+            except zipfile.BadZipFile:
+                log_queue.put(f" W: Skipping invalid or corrupted ZIP file: {zip_filename}")
+            except Exception as zip_e:
+                log_queue.put(f" E: Error opening or reading ZIP file {zip_filename}: {zip_e}")
+                log_queue.put(traceback.format_exc())
+            # --- End processing one zip file ---
+
+            # Update progress based on ZIP files processed
+            progress_queue.put(0.3 * (zip_idx + 1) / total_zips) # Pass 1 is ~30%
+
+        # --- End loop over all zip files ---
+
+
+        log_queue.put(f"Finished Pass 1. Processed {processed_count} valid sectors from {total_zips} ZIP files.")
         if processed_count == 0:
-            log_queue.put("Error: No valid sector data could be processed.")
+            log_queue.put("Error: No valid sector data could be processed from any ZIP file.")
             progress_queue.put(-1.0) # Error
             return
 
-        # --- Determine Map Bounds ---
+        # --- Determine Map Bounds (remains the same) ---
         min_sx = min(c[0] for c in all_coords)
         max_sx = max(c[0] for c in all_coords)
         min_sy = min(c[1] for c in all_coords)
         max_sy = max(c[1] for c in all_coords)
         log_queue.put(f"Determined Sector Coordinate Range: X=[{min_sx}-{max_sx}], Y=[{min_sy}-{max_sy}]")
 
-        # --- Calculate Final Map Size ---
+        # --- Calculate Final Map Size (remains the same) ---
         current_overlap = sector_overlap
-        # Clamp overlap to valid range
-        max_possible_overlap = min(LAYOUT_SECTOR_WIDTH, LAYOUT_SECTOR_HEIGHT) -1 # Need at least 1 non-overlapping pixel
+        max_possible_overlap = min(LAYOUT_SECTOR_WIDTH, LAYOUT_SECTOR_HEIGHT) -1
         if not (0 <= current_overlap <= max_possible_overlap) :
              log_queue.put(f"Warning: Invalid SECTOR_OVERLAP ({current_overlap}). Clamping to range [0, {max_possible_overlap}].")
              current_overlap = max(0, min(current_overlap, max_possible_overlap))
-
         effective_sector_width = LAYOUT_SECTOR_WIDTH - current_overlap
         effective_sector_height = LAYOUT_SECTOR_HEIGHT - current_overlap
-
-        # Handle cases where effective size becomes zero or negative due to large overlap
         if effective_sector_width <= 0 or effective_sector_height <= 0:
-             log_queue.put(f"Error: Overlap ({current_overlap}) is too large for sector dimensions ({LAYOUT_SECTOR_WIDTH}x{LAYOUT_SECTOR_HEIGHT}). Effective size is non-positive.")
+             log_queue.put(f"Error: Overlap ({current_overlap}) is too large for sector dimensions. Effective size is non-positive.")
              progress_queue.put(-1.0)
              return
-
-
         num_sectors_x = max_sx - min_sx + 1
         num_sectors_y = max_sy - min_sy + 1
-
-        # Calculate dimensions based on number of sectors and effective size + the last full sector dim
         final_width = (num_sectors_x - 1) * effective_sector_width + LAYOUT_SECTOR_WIDTH if num_sectors_x > 0 else 0
         final_height = (num_sectors_y - 1) * effective_sector_height + LAYOUT_SECTOR_HEIGHT if num_sectors_y > 0 else 0
-
-        # Ensure non-negative dimensions
         final_width = max(0, final_width)
         final_height = max(0, final_height)
-
-        # Handle single sector case
         if num_sectors_x <= 1: final_width = LAYOUT_SECTOR_WIDTH
         if num_sectors_y <= 1: final_height = LAYOUT_SECTOR_HEIGHT
-
-
         log_queue.put(f"Using Overlap={current_overlap}, Blend Size={boundary_blend_size}")
         log_queue.put(f"Calculated final map dimensions: {final_width} x {final_height}")
-
         if final_width <= 0 or final_height <= 0:
             log_queue.put("Error: Calculated final map dimensions are zero or negative.")
             progress_queue.put(-1.0) # Error
             return
+        # ---
 
-        # --- Allocate Memory ---
+        # --- Allocate Memory (remains the same) ---
         try:
             log_queue.put(f"Allocating final map arrays ({final_height} x {final_width})...")
-            # Use float64 for sums to minimize precision loss during accumulation
             heightmap_sum_array = np.zeros((final_height, final_width), dtype=np.float64)
             weight_sum_array = np.zeros((final_height, final_width), dtype=np.float64)
             log_queue.put("Allocation successful.")
         except MemoryError:
-            log_queue.put(f"Error: Not enough memory to allocate map arrays of size {final_height} x {final_width}.")
-            progress_queue.put(-1.0) # Error
-            return
+             log_queue.put(f"Error: Not enough memory to allocate map arrays of size {final_height} x {final_width}.")
+             progress_queue.put(-1.0); return
         except Exception as e:
-            log_queue.put(f"Error creating numpy arrays: {e}")
-            progress_queue.put(-1.0) # Error
-            return
+             log_queue.put(f"Error creating numpy arrays: {e}"); progress_queue.put(-1.0); return
+        # ---
 
-        # --- Global Base Correction (Optional but good for consistency) ---
-        # Compute a global average base from all sectors
+        # --- Global Base Correction (remains the same) ---
         base_sum = 0.0
         base_count = 0
         for data in sectors_data.values():
-            # Check if base_h is valid (might be None or skipped)
-            if 'base_h' in data and data['base_h'] is not None:
-                 base_sum += data['base_h']
-                 base_count += 1
+             if 'base_h' in data and data['base_h'] is not None:
+                  base_sum += data['base_h']; base_count += 1
+        if base_count > 0: global_base = base_sum / base_count
+        else: global_base = 0.0; log_queue.put("W: Could not compute global average base...")
+        log_queue.put(f"Global average base computed: {global_base:.2f} from {base_count} sectors.")
+        # ---
 
-        if base_count > 0:
-            global_base = base_sum / base_count
-            log_queue.put(f"Global average base computed: {global_base:.2f} from {base_count} sectors.")
-        else:
-            global_base = 0.0
-            log_queue.put("W: Could not compute global average base (no valid base_h found). Using 0.0.")
-
-        # --- Pass 2: Calculate Height, Smooth (Optional), and Blend ---
+        # --- Pass 2: Calculate Height, Smooth (Optional), and Blend (remains the same) ---
         log_queue.put("--- Pass 2: Calculating heights, smoothing, and blending ---")
         placed_count = 0
-        overall_min_h = float('inf')
-        overall_max_h = float('-inf')
+        overall_min_h = float('inf'); overall_max_h = float('-inf')
         first_sector_processed = False
-        total_sectors_to_place = len(sectors_data)
+        total_sectors_to_place = len(sectors_data) # Use count of successfully read sectors
 
         for i, ((sx, sy), data) in enumerate(sectors_data.items()):
-            sector_w = data['width']
-            sector_h = data['height']
-            if 'detiled_offsets' not in data or data['detiled_offsets'] is None or \
-               'base_h' not in data or data['base_h'] is None:
-                log_queue.put(f" W: Skipping sector ({sx},{sy}) due to missing data.")
-                continue
-
-            # Calculate absolute height: Apply base correction and scale factor
-            # Corrected: Apply base adjustment relative to the global average
+            # --- This whole inner loop logic remains IDENTICAL ---
+            sector_w = data['width']; sector_h = data['height']
             base_adjustment = data['base_h'] - global_base
             absolute_height_sector_float = (data['detiled_offsets'].astype(np.float64) / height_scale_factor) + base_adjustment
-
-            # Apply tile boundary smoothing if enabled
             if apply_boundary_smoothing:
                 absolute_height_sector_float = smooth_tile_boundaries(absolute_height_sector_float, TILE_WIDTH, TILE_HEIGHT, log_queue)
-
-            # Update overall min/max *after* smoothing and scaling
-            sector_min = np.nanmin(absolute_height_sector_float) # Use nanmin/nanmax
+            sector_min = np.nanmin(absolute_height_sector_float)
             sector_max = np.nanmax(absolute_height_sector_float)
             if np.isfinite(sector_min) and np.isfinite(sector_max):
-                 overall_min_h = min(overall_min_h, sector_min)
-                 overall_max_h = max(overall_max_h, sector_max)
+                 overall_min_h = min(overall_min_h, sector_min); overall_max_h = max(overall_max_h, sector_max)
                  first_sector_processed = True
-            else:
-                 log_queue.put(f" W: Sector ({sx},{sy}) resulted in non-finite min/max heights after processing.")
-
-
-            # Create weight map for blending
+            else: log_queue.put(f" W: Sector ({sx},{sy}) resulted in non-finite heights...")
             weight_map = create_weight_map(sector_h, sector_w, boundary_blend_size)
-
-            # Calculate paste position
-            grid_x = sx - min_sx
-            grid_y = sy - min_sy
-            paste_x_start = grid_x * effective_sector_width
-            paste_y_start = grid_y * effective_sector_height
-            paste_x_end = paste_x_start + sector_w
-            paste_y_end = paste_y_start + sector_h
-
-            # Clip paste coordinates and calculate source/target slices
-            target_y_start_clipped = max(0, paste_y_start)
-            target_y_end_clipped = min(final_height, paste_y_end)
-            target_x_start_clipped = max(0, paste_x_start)
-            target_x_end_clipped = min(final_width, paste_x_end)
-
-            # Skip if clipped region is empty
-            if target_y_start_clipped >= target_y_end_clipped or target_x_start_clipped >= target_x_end_clipped:
-                log_queue.put(f" W: Sector ({sx},{sy}) is entirely outside the final map bounds after clipping. Skipping paste.")
-                continue
-
-            # Calculate source region based on clipping
-            clip_top = target_y_start_clipped - paste_y_start
-            clip_left = target_x_start_clipped - paste_x_start
-            clipped_height = target_y_end_clipped - target_y_start_clipped
-            clipped_width = target_x_end_clipped - target_x_start_clipped
-
-            source_y_start = clip_top
-            source_y_end = clip_top + clipped_height
-            source_x_start = clip_left
-            source_x_end = clip_left + clipped_width
-
-            # Define slices
-            target_slice = np.s_[target_y_start_clipped:target_y_end_clipped, target_x_start_clipped:target_x_end_clipped]
-            source_slice = np.s_[source_y_start:source_y_end, source_x_start:source_x_end]
-
-            # Safety check slice dimensions before applying
-            if absolute_height_sector_float[source_slice].shape != (clipped_height, clipped_width) or \
-               weight_map[source_slice].shape != (clipped_height, clipped_width):
-                 log_queue.put(f"  E: Slice dimension mismatch for sector ({sx},{sy})! Target({clipped_height},{clipped_width}), SourceH{absolute_height_sector_float[source_slice].shape}, SourceW{weight_map[source_slice].shape}. Skipping paste.")
-                 continue
-
-
-            # Perform weighted addition using the calculated slices
+            grid_x = sx - min_sx; grid_y = sy - min_sy
+            paste_x_start = grid_x * effective_sector_width; paste_y_start = grid_y * effective_sector_height
+            paste_x_end = paste_x_start + sector_w; paste_y_end = paste_y_start + sector_h
+            target_y_start_clipped=max(0,paste_y_start); target_y_end_clipped=min(final_height,paste_y_end)
+            target_x_start_clipped=max(0,paste_x_start); target_x_end_clipped=min(final_width,paste_x_end)
+            if target_y_start_clipped >= target_y_end_clipped or target_x_start_clipped >= target_x_end_clipped: continue
+            clip_top=target_y_start_clipped-paste_y_start; clip_left=target_x_start_clipped-paste_x_start
+            clipped_height=target_y_end_clipped-target_y_start_clipped; clipped_width=target_x_end_clipped-target_x_start_clipped
+            source_y_start=clip_top; source_y_end=clip_top+clipped_height
+            source_x_start=clip_left; source_x_end=clip_left+clipped_width
+            target_slice=np.s_[target_y_start_clipped:target_y_end_clipped, target_x_start_clipped:target_x_end_clipped]
+            source_slice=np.s_[source_y_start:source_y_end, source_x_start:source_x_end]
+            if absolute_height_sector_float[source_slice].shape != (clipped_height,clipped_width) or weight_map[source_slice].shape != (clipped_height,clipped_width):
+                 log_queue.put(f" E: Slice mismatch for sector ({sx},{sy})! Skipping paste."); continue
             try:
-                source_heights = absolute_height_sector_float[source_slice]
-                source_weights = weight_map[source_slice]
+                 source_heights = absolute_height_sector_float[source_slice]
+                 source_weights = weight_map[source_slice]
+                 valid_mask = np.isfinite(source_heights)
+                 heightmap_sum_array[target_slice][valid_mask] += source_heights[valid_mask] * source_weights[valid_mask]
+                 weight_sum_array[target_slice][valid_mask] += source_weights[valid_mask]
+                 placed_count += 1
+            except Exception as e: log_queue.put(f" E: Error during weighted add for ({sx},{sy}): {e}"); log_queue.put(traceback.format_exc()); continue
+            # --- End of identical inner loop ---
 
-                # Ensure we only add valid (non-NaN) heights
-                valid_mask = np.isfinite(source_heights)
-
-                heightmap_sum_array[target_slice][valid_mask] += source_heights[valid_mask] * source_weights[valid_mask]
-                weight_sum_array[target_slice][valid_mask] += source_weights[valid_mask]
-                placed_count += 1
-            except IndexError as e:
-                 log_queue.put(f"  E: IndexError during weighted addition for sector ({sx},{sy}): {e}. Slice mismatch likely.")
-                 log_queue.put(f"     Target slice: {target_slice}")
-                 log_queue.put(f"     Source slice: {source_slice}")
-                 continue # Skip this sector placement
-            except Exception as e:
-                 log_queue.put(f"  E: Unexpected error during weighted addition for sector ({sx},{sy}): {e}")
-                 log_queue.put(traceback.format_exc())
-                 continue # Skip this sector placement
-
+            # Update progress based on SECTORS processed in this pass
             progress_queue.put(0.3 + 0.6 * (i + 1) / total_sectors_to_place) # Pass 2 is ~60%
 
         log_queue.put(f"Finished Pass 2. Blended data from {placed_count} sector placements.")
@@ -628,66 +609,41 @@ def generate_heightmap(config, log_queue, progress_queue):
             progress_queue.put(-1.0) # Error
             return
 
-        # --- Pass 3: Finalize Map (Divide by weights and Normalize) ---
+        # --- Pass 3: Finalize Map (Divide by weights and Normalize) (remains the same) ---
         log_queue.put("--- Pass 3: Finalizing map and normalizing ---")
-
-        # Check if any valid heights were found
         if not first_sector_processed or not np.isfinite(overall_min_h) or not np.isfinite(overall_max_h):
-            log_queue.put(" W: No valid finite height range found across all sectors. Cannot determine normalization range accurately.")
-             # Attempt to find min/max from the blended result *before* division
+            log_queue.put(" W: No valid finite height range found...") # Handle as before
             temp_min = np.nanmin(heightmap_sum_array[weight_sum_array > 1e-9])
             temp_max = np.nanmax(heightmap_sum_array[weight_sum_array > 1e-9])
-            if np.isfinite(temp_min) and np.isfinite(temp_max):
-                 overall_min_h = temp_min
-                 overall_max_h = temp_max
-                 log_queue.put(f" W: Using range from blended sums: [{overall_min_h:.2f}, {overall_max_h:.2f}]")
-            else:
-                 log_queue.put(" W: Could not determine range even from sums. Defaulting to [0, 1] for normalization, output may be blank.")
-                 overall_min_h = 0.0
-                 overall_max_h = 1.0
-        else:
-             log_queue.put(f"Global Calculated Height Range (Pre-Normalization): [{overall_min_h:.2f}, {overall_max_h:.2f}]")
-
-        # Divide sum by weights to get average height, handle division by zero
-        log_queue.put("Calculating final heights (division by weights)...")
-        final_heightmap_float = np.full((final_height, final_width), np.nan, dtype=np.float32) # Use float32 for final map
-        valid_weights_mask = weight_sum_array > 1e-9 # Avoid division by zero or near-zero
-
-        # Perform division only where weights are valid
+            if np.isfinite(temp_min) and np.isfinite(temp_max): overall_min_h=temp_min; overall_max_h=temp_max; log_queue.put(f" W: Using range from sums: [{overall_min_h:.2f}, {overall_max_h:.2f}]")
+            else: overall_min_h=0.0; overall_max_h=1.0; log_queue.put(" W: Could not determine range...")
+        else: log_queue.put(f"Global Height Range: [{overall_min_h:.2f}, {overall_max_h:.2f}]")
+        log_queue.put("Calculating final heights...")
+        final_heightmap_float = np.full((final_height, final_width), np.nan, dtype=np.float32)
+        valid_weights_mask = weight_sum_array > 1e-9
         np.divide(heightmap_sum_array, weight_sum_array, out=final_heightmap_float, where=valid_weights_mask)
-
-        # Normalization (Min-Max to 0-255)
-        log_queue.put("Normalizing heightmap to 8-bit grayscale using Min-Max...")
-        norm_min = overall_min_h
-        norm_max = overall_max_h
+        log_queue.put("Normalizing heightmap...")
+        norm_min = overall_min_h; norm_max = overall_max_h
         log_queue.put(f"Normalization Range Used: [{norm_min:.2f}, {norm_max:.2f}] -> [0, 255]")
-
-        # Determine background color (use the minimum value of the range)
-        # Pixels with no data (or NaN results) will get this value
         DEFAULT_BG_COLOR_FLOAT = norm_min
         final_heightmap_float[~valid_weights_mask] = DEFAULT_BG_COLOR_FLOAT
-        final_heightmap_float[np.isnan(final_heightmap_float)] = DEFAULT_BG_COLOR_FLOAT # Handle NaNs from calculation
-
-        # Calculate normalization range, handle case where min == max
+        final_heightmap_float[np.isnan(final_heightmap_float)] = DEFAULT_BG_COLOR_FLOAT
         norm_range = norm_max - norm_min
-        if norm_range <= 1e-9: # Use a small epsilon for float comparison
-            log_queue.put(" W: Normalization range is zero or negative. Output will be flat.")
-            # Output a map of all zeros (or mid-gray 128?) Let's use 0.
+        if norm_range <= 1e-9:
+            log_queue.put(" W: Normalization range zero...")
             heightmap_8bit = np.full((final_height, final_width), 0, dtype=np.uint8)
         else:
-            # Apply normalization: (value - min) / range
             normalized_map = (final_heightmap_float - norm_min) / norm_range
-            # Clip values strictly between 0.0 and 1.0
             np.clip(normalized_map, 0.0, 1.0, out=normalized_map)
-            # Scale to 0-255 and convert to uint8
             heightmap_8bit = (normalized_map * 255.0).astype(np.uint8)
+        # ---
 
         progress_queue.put(0.95) # Almost done
 
-        # --- Save the Final Image ---
+        # --- Save the Final Image (remains the same) ---
         try:
             log_queue.put(f"Saving final heightmap to {output_file_path}...")
-            img = Image.fromarray(heightmap_8bit, mode='L') # 'L' mode for 8-bit grayscale
+            img = Image.fromarray(heightmap_8bit, mode='L')
             img.save(output_file_path)
             log_queue.put("\n--- Processing Complete ---")
             log_queue.put(f"Output saved as: {output_file_path}")
@@ -729,7 +685,7 @@ gui_state = {
     "sector_overlap": 1,
     "boundary_blend_size": 10,
     "height_scale_factor": 1.0,
-    "log_messages": ["Welcome! Select a folder and click Generate."],
+    "log_messages": ["Welcome! Select a folder containing ZIP archives and click Generate."], # Modified welcome
     "progress": 0.0,
     "processing_thread": None,
     "is_processing": False,
@@ -756,6 +712,8 @@ def update_log_and_progress():
             gui_state["progress"] = progress
         # If progress reaches 1.0, processing is done
         if gui_state["progress"] >= 1.0:
+             # Keep is_processing True until thread fully joins? Optional.
+             # For now, just set to False based on progress signal.
              gui_state["is_processing"] = False
 
 
@@ -766,16 +724,20 @@ def run_gui_imgui_bundle():
         global gui_state
 
         # Check for updates from processing thread
-        if gui_state["is_processing"]:
+        # Use a flag to prevent race condition if thread finishes quickly
+        was_processing_last_frame = gui_state["is_processing"]
+        if was_processing_last_frame:
             update_log_and_progress()
-            # Check if thread finished
+            # Check if thread finished AFTER updating progress
             if gui_state["processing_thread"] and not gui_state["processing_thread"].is_alive():
+                # Ensure final updates are processed if thread ended
+                update_log_and_progress()
                 gui_state["is_processing"] = False
                 gui_state["processing_thread"] = None
-                # Final update in case messages arrived after last check
-                update_log_and_progress()
-                if gui_state["progress"] < 1.0 and gui_state["progress"] >= 0: # Didn't finish cleanly?
+                # Check if progress didn't reach 1.0 (might indicate thread error)
+                if gui_state["progress"] < 1.0 and gui_state["progress"] >= 0:
                      gui_state["log_messages"].append("Warning: Processing ended prematurely.")
+                     gui_state["progress"] = 0.0 # Reset progress if ended badly
 
         # NO imgui.set_next_window_size or imgui.begin here - draw directly on viewport
 
@@ -898,7 +860,7 @@ def run_gui_imgui_bundle():
         log_height = imgui.get_content_region_avail().y - 5 # Fill remaining vertical space
         # Use ImVec2 for size and child_flags for border with imgui-bundle
         # Make sure flag is singular 'border'
-        imgui.begin_child("Log", size=ImVec2(-1, log_height), child_flags=imgui.ChildFlags_.borders) # Auto width
+        imgui.begin_child("Log", size=ImVec2(-1, log_height), child_flags=imgui.ChildFlags_.borders) # Use singular 'border'
         imgui.text_unformatted("\n".join(gui_state["log_messages"]))
         # Auto-scroll
         if imgui.get_scroll_y() >= imgui.get_scroll_max_y():
@@ -910,12 +872,12 @@ def run_gui_imgui_bundle():
     # Use hello_imgui runner
     runner_params = hello_imgui.RunnerParams()
     runner_params.app_window_params.window_title = "Sector Heightmap Generator"
+    # Set desired initial window size for the whole application
+# Set desired initial window size using window_geometry
+    runner_params.app_window_params.window_geometry.size = (650, 600)
     runner_params.imgui_window_params.show_menu_bar = False
     # Set the GUI function
     runner_params.callbacks.show_gui = gui_loop
-
-    # Customize other params if needed
-    # runner_params.app_window_params.window_size = (650, 600)
 
     hello_imgui.run(runner_params)
 
@@ -933,7 +895,7 @@ def run_gui_pyimgui():
     glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
     glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, gl.GL_TRUE)
 
-    window = glfw.create_window(600, 550, "Sector Heightmap Generator", None, None)
+    window = glfw.create_window(650, 600, "Sector Heightmap Generator", None, None) # Adjusted size
     if not window:
         glfw.terminate()
         print("Could not initialize Window")
@@ -955,16 +917,18 @@ def run_gui_pyimgui():
         # --- GUI Definition ---
         global gui_state
 
-        # Check for updates from processing thread
-        if gui_state["is_processing"]:
+        # Check for updates from processing thread (logic is same as bundle)
+        was_processing_last_frame_pyi = gui_state["is_processing"]
+        if was_processing_last_frame_pyi:
             update_log_and_progress()
-            # Check if thread finished
             if gui_state["processing_thread"] and not gui_state["processing_thread"].is_alive():
+                update_log_and_progress()
                 gui_state["is_processing"] = False
                 gui_state["processing_thread"] = None
-                update_log_and_progress() # Final update
                 if gui_state["progress"] < 1.0 and gui_state["progress"] >= 0:
                      gui_state["log_messages"].append("Warning: Processing ended prematurely.")
+                     gui_state["progress"] = 0.0
+
 
         # NO imgui.set_next_window_size or imgui.begin here
 
@@ -997,21 +961,20 @@ def run_gui_pyimgui():
         imgui.push_item_width(100)
         # Using lists for input_int/float in pyimgui
         overlap_val = [gui_state["sector_overlap"]]
-        changed = imgui.input_int("Sector Overlap", overlap_val)
-        if changed: gui_state["sector_overlap"] = max(0, overlap_val[0])
-        # Tooltip for pyimgui might need to be placed after item if is_item_hovered used alone
+        changed_overlap = imgui.input_int("Sector Overlap", overlap_val)
+        if changed_overlap: gui_state["sector_overlap"] = max(0, overlap_val[0])
         if imgui.is_item_hovered(): imgui.set_tooltip("Number of pixels sectors overlap...")
 
 
         blend_val = [gui_state["boundary_blend_size"]]
-        changed = imgui.input_int("Boundary Blend Size", blend_val)
-        if changed: gui_state["boundary_blend_size"] = max(0, blend_val[0])
+        changed_blend = imgui.input_int("Boundary Blend Size", blend_val)
+        if changed_blend: gui_state["boundary_blend_size"] = max(0, blend_val[0])
         if imgui.is_item_hovered(): imgui.set_tooltip("Size of the feathered edge...")
 
 
         scale_val = [gui_state["height_scale_factor"]]
-        changed = imgui.input_float("Height Scale Factor", scale_val, 0.1, 1.0, "%.2f")
-        if changed:
+        changed_scale = imgui.input_float("Height Scale Factor", scale_val, 0.1, 1.0, "%.2f")
+        if changed_scale:
             gui_state["height_scale_factor"] = scale_val[0]
             if gui_state["height_scale_factor"] <= 0: gui_state["height_scale_factor"] = 0.01
         if imgui.is_item_hovered(): imgui.set_tooltip("Divisor for the raw uint16 height offset value...")
@@ -1027,14 +990,13 @@ def run_gui_pyimgui():
         button_needs_disabling_pyi = gui_state["is_processing"]
 
         # Conditionally push style/flags *just before* the button
-        # Using try-except for potentially missing internal methods/different enums
-        # Or use begin_disabled if available in the target pyimgui version
+        # Prefer public API if available
         use_begin_disabled_pyi = hasattr(imgui, "begin_disabled")
         if button_needs_disabling_pyi:
             if use_begin_disabled_pyi:
                 imgui.begin_disabled(True)
             else:
-                try: # Fallback to internal flags
+                try: # Fallback to internal flags if begin_disabled not present
                     imgui.internal.push_item_flag(imgui.ITEM_DISABLED, True)
                 except AttributeError: pass # Ignore if not available
             # Still apply alpha for visual cue
