@@ -10,7 +10,7 @@ import traceback
 import threading
 import time
 from queue import Queue  # For thread-safe communication
-import zipfile         # <--- Added import
+import zipfile         # Keep this import
 
 # --- ImGui / GUI specific imports ---
 # Use tkinter for the folder dialog as it's often built-in
@@ -60,6 +60,7 @@ LAYOUT_SECTOR_HEIGHT = 224
 
 # --- Helper Functions (mostly unchanged) ---
 def parse_filename(filename):
+    # Regex should still work fine as it captures digits before the suffix
     match = re.match(r'(\d{3})_(\d{3})_.*\.sector', os.path.basename(filename))
     if match:
         return int(match.group(1)), int(match.group(2))
@@ -361,14 +362,15 @@ def generate_heightmap(config, log_queue, progress_queue):
         apply_boundary_smoothing = config['apply_boundary_smoothing']
         sector_overlap = config['sector_overlap']
         boundary_blend_size = config['boundary_blend_size']
-        height_scale_factor = config['height_scale_factor'] # Make sure this is float
+        height_scale_factor = config['height_scale_factor']
+        sector_suffix_type = config['sector_suffix_type'] # <--- Get suffix type
 
         if not input_dir or not os.path.isdir(input_dir):
             log_queue.put("Error: Input directory is not valid.")
             progress_queue.put(-1.0) # Indicate error
             return
 
-        # --- Parameter validation (keep as is) ---
+        # --- Parameter validation ---
         if height_scale_factor == 0:
              log_queue.put("Error: Height Scale Factor cannot be zero.")
              progress_queue.put(-1.0)
@@ -389,7 +391,17 @@ def generate_heightmap(config, log_queue, progress_queue):
         log_queue.put("Normalization: Min-Max")
         progress_queue.put(0.0)
 
-        # --- Find ZIP files instead of .sector files ---
+        # Determine the required suffix (case-insensitive)
+        if sector_suffix_type == "B0":
+            required_suffix = "_b0.sector"
+        elif sector_suffix_type == "D1":
+            required_suffix = "_d1.sector"
+        else: # Assume d2
+            required_suffix = "_d2.sector"
+        log_queue.put(f"Searching for sectors ending with: '{required_suffix}' (case-insensitive)")
+        # ---
+
+        # --- Find ZIP files ---
         all_zip_files = glob.glob(os.path.join(input_dir, '*.zip'))
         log_queue.put(f"Found {len(all_zip_files)} ZIP files to scan.")
         if not all_zip_files:
@@ -415,16 +427,15 @@ def generate_heightmap(config, log_queue, progress_queue):
                 with zipfile.ZipFile(zip_filepath, 'r') as zf:
                     # Get names of all files within the zip
                     member_names = zf.namelist()
-                    # Filter for .sector files
+                    # --- MODIFIED FILTER ---
                     sector_members = [
                         name for name in member_names
-                        if name.lower().endswith('.sector')
-                        # Optionally add more filtering, e.g., ensure it's in root or specific dir
-                        # and not os.path.dirname(name) # Example: only root files
+                        if name.lower().endswith(required_suffix) # Use the required suffix
                     ]
+                    # --- END MODIFIED FILTER ---
 
                     if not sector_members:
-                        log_queue.put(f"    No .sector files found in {zip_filename}")
+                        log_queue.put(f"    No sectors matching '{required_suffix}' found in {zip_filename}")
                         continue
 
                     # --- Iterate through .sector files found WITHIN the current zip ---
@@ -433,6 +444,11 @@ def generate_heightmap(config, log_queue, progress_queue):
                         sx, sy = parse_filename(filename_short)
                         if sx is None or sy is None:
                             log_queue.put(f"    W: Skipping '{filename_short}' in {zip_filename}, could not parse coordinates.")
+                            continue
+
+                        # Prevent processing duplicates if coordinates already exist
+                        if (sx, sy) in sectors_data:
+                            log_queue.put(f"    W: Skipping '{filename_short}' in {zip_filename}, coordinates ({sx},{sy}) already processed from another file.")
                             continue
 
                         try:
@@ -671,7 +687,7 @@ def select_folder_dialog():
     root.withdraw()  # Hide the main tkinter window
     # Make the dialog appear on top
     root.attributes('-topmost', True)
-    folder_path = filedialog.askdirectory(title="Select Folder Containing .sector Files")
+    folder_path = filedialog.askdirectory(title="Select Folder Containing .sector ZIP Archives") # Modified title
     root.destroy() # Close the hidden tkinter window
     return folder_path
 
@@ -679,12 +695,13 @@ def select_folder_dialog():
 
 # Global state for the GUI
 gui_state = {
-    "input_dir": "",
+    "input_dir": "C:\Program Files (x86)\Steam\steamapps\common\Sacred 2 Gold\pak",
     "output_filename": "heightmap_output.png",
     "apply_boundary_smoothing": True,
     "sector_overlap": 1,
     "boundary_blend_size": 10,
     "height_scale_factor": 1.0,
+    "sector_suffix_type": "B0", # <--- Added suffix state, default "B0"
     "log_messages": ["Welcome! Select a folder containing ZIP archives and click Generate."], # Modified welcome
     "progress": 0.0,
     "processing_thread": None,
@@ -724,202 +741,8 @@ def run_gui_imgui_bundle():
         global gui_state
 
         # Check for updates from processing thread
-        # Use a flag to prevent race condition if thread finishes quickly
         was_processing_last_frame = gui_state["is_processing"]
         if was_processing_last_frame:
-            update_log_and_progress()
-            # Check if thread finished AFTER updating progress
-            if gui_state["processing_thread"] and not gui_state["processing_thread"].is_alive():
-                # Ensure final updates are processed if thread ended
-                update_log_and_progress()
-                gui_state["is_processing"] = False
-                gui_state["processing_thread"] = None
-                # Check if progress didn't reach 1.0 (might indicate thread error)
-                if gui_state["progress"] < 1.0 and gui_state["progress"] >= 0:
-                     gui_state["log_messages"].append("Warning: Processing ended prematurely.")
-                     gui_state["progress"] = 0.0 # Reset progress if ended badly
-
-        # NO imgui.set_next_window_size or imgui.begin here - draw directly on viewport
-
-        # --- Input Folder ---
-        imgui.push_item_width(-200) # Make text input fill width minus button
-        changed, gui_state["input_dir"] = imgui.input_text("##InputFolder", gui_state["input_dir"], 2048)
-        imgui.pop_item_width()
-        imgui.same_line()
-        if imgui.button("Select Input Folder"):
-            selected = select_folder_dialog()
-            if selected:
-                gui_state["input_dir"] = selected
-
-        # --- Output Filename ---
-        imgui.push_item_width(-150) # Adjust width as needed
-        changed, gui_state["output_filename"] = imgui.input_text("Output Filename", gui_state["output_filename"], 256)
-        imgui.pop_item_width()
-        if imgui.is_item_hovered():
-             imgui.set_tooltip("Filename for the output PNG image (saved in input folder).")
-
-
-        imgui.separator()
-        # --- Configuration Options ---
-        imgui.text("Configuration:")
-
-        changed, gui_state["apply_boundary_smoothing"] = imgui.checkbox("Apply Tile Boundary Smoothing", gui_state["apply_boundary_smoothing"])
-        if imgui.is_item_hovered():
-             imgui.set_tooltip("Averages pixels at the boundaries of the 7x7 tiles.")
-
-        # Use InputInt for integer values, InputFloat for float
-        imgui.push_item_width(100) # Set width for next items
-        changed, gui_state["sector_overlap"] = imgui.input_int("Sector Overlap", gui_state["sector_overlap"])
-        # Basic validation / clamping
-        gui_state["sector_overlap"] = max(0, gui_state["sector_overlap"]) # Ensure non-negative
-        if imgui.is_item_hovered():
-            imgui.set_tooltip("Number of pixels sectors overlap when stitching (0 to SectorDim-1).")
-
-
-        changed, gui_state["boundary_blend_size"] = imgui.input_int("Boundary Blend Size", gui_state["boundary_blend_size"])
-        gui_state["boundary_blend_size"] = max(0, gui_state["boundary_blend_size"]) # Ensure non-negative
-        if imgui.is_item_hovered():
-            imgui.set_tooltip("Size of the feathered edge (in pixels) for blending between overlapping sectors.")
-
-        changed, gui_state["height_scale_factor"] = imgui.input_float("Height Scale Factor", gui_state["height_scale_factor"], 0.1, 1.0, "%.2f")
-        # Prevent division by zero - enforce a minimum positive value
-        if gui_state["height_scale_factor"] <= 0:
-             gui_state["height_scale_factor"] = 0.01 # Set a small positive default
-        if imgui.is_item_hovered():
-            imgui.set_tooltip("Divisor for the raw uint16 height offset value. Height = Base + Offset / Factor.")
-
-        imgui.pop_item_width()
-
-
-        imgui.separator()
-
-        # --- Action Button & Progress ---
-
-        # Evaluate the condition ONCE per frame before the button
-        button_needs_disabling = gui_state["is_processing"]
-
-        # Use the public API imgui.begin_disabled() / imgui.end_disabled()
-        if button_needs_disabling:
-            # Begin the disabled state block
-            imgui.begin_disabled(True) # Pass True to disable
-            # Push the style modification *inside* the disabled block
-            imgui.push_style_var(imgui.StyleVar_.alpha, imgui.get_style().alpha * 0.5)
-
-        # Render the button widget.
-        # It will be visually disabled and non-interactive if begin_disabled(True) was called.
-        button_clicked = imgui.button("Generate Heightmap")
-
-        # End the disabled state block *if it was started*
-        if button_needs_disabling:
-            # Pop the style *before* ending the disabled block (LIFO)
-            imgui.pop_style_var()
-            # End the disabled state block
-            imgui.end_disabled()
-
-        # Now, handle the button click *after* the stack/state is potentially restored
-        # Note: button_clicked should be False if the button was disabled.
-        if button_clicked:
-            # Only start if not already processing
-            if not gui_state["is_processing"]:
-                # Start processing in a separate thread
-                gui_state["is_processing"] = True # State change happens here
-                gui_state["progress"] = 0.0
-                gui_state["log_messages"] = ["Starting processing..."] # Clear log
-
-                # Prepare config dict
-                current_config = {
-                    'input_dir': gui_state["input_dir"],
-                    'output_filename': gui_state["output_filename"],
-                    'apply_boundary_smoothing': gui_state["apply_boundary_smoothing"],
-                    'sector_overlap': gui_state["sector_overlap"],
-                    'boundary_blend_size': gui_state["boundary_blend_size"],
-                    'height_scale_factor': gui_state["height_scale_factor"],
-                   }
-
-                # Clear queues before starting
-                while not gui_state["log_queue"].empty(): gui_state["log_queue"].get()
-                while not gui_state["progress_queue"].empty(): gui_state["progress_queue"].get()
-
-                gui_state["processing_thread"] = threading.Thread(
-                    target=generate_heightmap,
-                    args=(current_config, gui_state["log_queue"], gui_state["progress_queue"]),
-                    daemon=True
-                )
-                gui_state["processing_thread"].start()
-
-        # Render the progress bar (always visible)
-        imgui.same_line()
-        imgui.progress_bar(gui_state["progress"], size_arg=ImVec2(-1, 0)) # Auto width
-
-        # --- End of Action Button & Progress Section ---
-
-        imgui.separator()
-
-        # --- Log Area ---
-        imgui.text("Log:")
-        log_height = imgui.get_content_region_avail().y - 5 # Fill remaining vertical space
-        # Use ImVec2 for size and child_flags for border with imgui-bundle
-        # Make sure flag is singular 'border'
-        imgui.begin_child("Log", size=ImVec2(-1, log_height), child_flags=imgui.ChildFlags_.borders) # Use singular 'border'
-        imgui.text_unformatted("\n".join(gui_state["log_messages"]))
-        # Auto-scroll
-        if imgui.get_scroll_y() >= imgui.get_scroll_max_y():
-             imgui.set_scroll_here_y(1.0)
-        imgui.end_child()
-
-        # NO imgui.end() here
-
-    # Use hello_imgui runner
-    runner_params = hello_imgui.RunnerParams()
-    runner_params.app_window_params.window_title = "Sector Heightmap Generator"
-    # Set desired initial window size for the whole application
-# Set desired initial window size using window_geometry
-    runner_params.app_window_params.window_geometry.size = (650, 600)
-    runner_params.imgui_window_params.show_menu_bar = False
-    # Set the GUI function
-    runner_params.callbacks.show_gui = gui_loop
-
-    hello_imgui.run(runner_params)
-
-
-def run_gui_pyimgui():
-    """Main function to run the GUI using older pyimgui and glfw."""
-    # --- GLFW Window Setup ---
-    if not glfw.init():
-        print("Could not initialize OpenGL context")
-        sys.exit(1)
-
-    # OS X supports only forward-compatible core profiles from 3.2
-    glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
-    glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
-    glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
-    glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, gl.GL_TRUE)
-
-    window = glfw.create_window(650, 600, "Sector Heightmap Generator", None, None) # Adjusted size
-    if not window:
-        glfw.terminate()
-        print("Could not initialize Window")
-        sys.exit(1)
-
-    glfw.make_context_current(window)
-
-    # --- ImGui Context and Renderer ---
-    imgui.create_context()
-    impl = GlfwRenderer(window)
-
-    # --- Main Loop ---
-    while not glfw.window_should_close(window):
-        glfw.poll_events()
-        impl.process_inputs()
-
-        imgui.new_frame()
-
-        # --- GUI Definition ---
-        global gui_state
-
-        # Check for updates from processing thread (logic is same as bundle)
-        was_processing_last_frame_pyi = gui_state["is_processing"]
-        if was_processing_last_frame_pyi:
             update_log_and_progress()
             if gui_state["processing_thread"] and not gui_state["processing_thread"].is_alive():
                 update_log_and_progress()
@@ -928,7 +751,6 @@ def run_gui_pyimgui():
                 if gui_state["progress"] < 1.0 and gui_state["progress"] >= 0:
                      gui_state["log_messages"].append("Warning: Processing ended prematurely.")
                      gui_state["progress"] = 0.0
-
 
         # NO imgui.set_next_window_size or imgui.begin here
 
@@ -957,6 +779,219 @@ def run_gui_pyimgui():
         changed, gui_state["apply_boundary_smoothing"] = imgui.checkbox("Apply Tile Boundary Smoothing", gui_state["apply_boundary_smoothing"])
         if imgui.is_item_hovered():
              imgui.set_tooltip("Averages pixels at the boundaries of the 7x7 tiles.")
+
+        # --- ADDED Radio Buttons for Sector Suffix ---
+        imgui.separator()
+        imgui.text("Sector Type Suffix:")
+        clicked_b0 = imgui.radio_button("B0 Sectors (_B0)", gui_state["sector_suffix_type"] == "B0")
+        if imgui.is_item_hovered(): imgui.set_tooltip("Search for sector files like 001_001_B0.sector")
+        imgui.same_line()
+        clicked_d1 = imgui.radio_button("D1 Sectors (_D1)", gui_state["sector_suffix_type"] == "D1")
+        if imgui.is_item_hovered(): imgui.set_tooltip("Search for sector files like 001_001_D1.sector")
+        imgui.same_line()
+        clicked_d2 = imgui.radio_button("d2 Sectors (_d2)", gui_state["sector_suffix_type"] == "d2")
+        if imgui.is_item_hovered(): imgui.set_tooltip("Search for sector files like 001_001_d2.sector")
+
+        if clicked_b0: gui_state["sector_suffix_type"] = "B0"
+        if clicked_d1: gui_state["sector_suffix_type"] = "D1"
+        if clicked_d2: gui_state["sector_suffix_type"] = "d2"
+        imgui.separator()
+        # --- End Radio Buttons ---
+
+
+        # Use InputInt for integer values, InputFloat for float
+        imgui.push_item_width(100) # Set width for next items
+        changed, gui_state["sector_overlap"] = imgui.input_int("Sector Overlap", gui_state["sector_overlap"])
+        gui_state["sector_overlap"] = max(0, gui_state["sector_overlap"])
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Number of pixels sectors overlap when stitching (0 to SectorDim-1).")
+
+
+        changed, gui_state["boundary_blend_size"] = imgui.input_int("Boundary Blend Size", gui_state["boundary_blend_size"])
+        gui_state["boundary_blend_size"] = max(0, gui_state["boundary_blend_size"])
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Size of the feathered edge (in pixels) for blending between overlapping sectors.")
+
+        changed, gui_state["height_scale_factor"] = imgui.input_float("Height Scale Factor", gui_state["height_scale_factor"], 0.1, 1.0, "%.2f")
+        if gui_state["height_scale_factor"] <= 0:
+             gui_state["height_scale_factor"] = 0.01
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Divisor for the raw uint16 height offset value. Height = Base + Offset / Factor.")
+
+        imgui.pop_item_width()
+
+
+        imgui.separator()
+
+        # --- Action Button & Progress ---
+
+        # Evaluate the condition ONCE per frame before the button
+        button_needs_disabling = gui_state["is_processing"]
+
+        # Use the public API imgui.begin_disabled() / imgui.end_disabled()
+        if button_needs_disabling:
+            imgui.begin_disabled(True)
+            imgui.push_style_var(imgui.StyleVar_.alpha, imgui.get_style().alpha * 0.5)
+
+        # Render the button widget.
+        button_clicked = imgui.button("Generate Heightmap")
+
+        # End the disabled state block *if it was started*
+        if button_needs_disabling:
+            imgui.pop_style_var()
+            imgui.end_disabled()
+
+        # Now, handle the button click *after* the stack/state is potentially restored
+        if button_clicked:
+            if not gui_state["is_processing"]:
+                gui_state["is_processing"] = True
+                gui_state["progress"] = 0.0
+                gui_state["log_messages"] = ["Starting processing..."]
+
+                # --- ADDED suffix type to config ---
+                current_config = {
+                    'input_dir': gui_state["input_dir"],
+                    'output_filename': gui_state["output_filename"],
+                    'apply_boundary_smoothing': gui_state["apply_boundary_smoothing"],
+                    'sector_overlap': gui_state["sector_overlap"],
+                    'boundary_blend_size': gui_state["boundary_blend_size"],
+                    'height_scale_factor': gui_state["height_scale_factor"],
+                    'sector_suffix_type': gui_state["sector_suffix_type"], # Pass selected type
+                   }
+                # ---
+
+                while not gui_state["log_queue"].empty(): gui_state["log_queue"].get()
+                while not gui_state["progress_queue"].empty(): gui_state["progress_queue"].get()
+
+                gui_state["processing_thread"] = threading.Thread(
+                    target=generate_heightmap,
+                    args=(current_config, gui_state["log_queue"], gui_state["progress_queue"]),
+                    daemon=True
+                )
+                gui_state["processing_thread"].start()
+
+        # Render the progress bar (always visible)
+        imgui.same_line()
+        imgui.progress_bar(gui_state["progress"], size_arg=ImVec2(-1, 0))
+
+        # --- End of Action Button & Progress Section ---
+
+        imgui.separator()
+
+        # --- Log Area ---
+        imgui.text("Log:")
+        log_height = imgui.get_content_region_avail().y - 5
+        # Make sure flag is singular 'border'
+        imgui.begin_child("Log", size=ImVec2(-1, log_height), child_flags=imgui.ChildFlags_.borders)
+        imgui.text_unformatted("\n".join(gui_state["log_messages"]))
+        if imgui.get_scroll_y() >= imgui.get_scroll_max_y():
+             imgui.set_scroll_here_y(1.0)
+        imgui.end_child()
+
+        # NO imgui.end() here
+
+    # Use hello_imgui runner
+    runner_params = hello_imgui.RunnerParams()
+    runner_params.app_window_params.window_title = "Sector Heightmap Generator"
+    # Set desired initial window size using window_geometry
+    runner_params.app_window_params.window_geometry.size = (650, 600) # Adjusted size
+    runner_params.imgui_window_params.show_menu_bar = False
+    runner_params.callbacks.show_gui = gui_loop
+
+    hello_imgui.run(runner_params)
+
+
+def run_gui_pyimgui():
+    """Main function to run the GUI using older pyimgui and glfw."""
+    # --- GLFW Window Setup ---
+    if not glfw.init():
+        print("Could not initialize OpenGL context")
+        sys.exit(1)
+
+    glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
+    glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
+    glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+    glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, gl.GL_TRUE)
+
+    window = glfw.create_window(650, 600, "Sector Heightmap Generator", None, None)
+    if not window:
+        glfw.terminate()
+        print("Could not initialize Window")
+        sys.exit(1)
+
+    glfw.make_context_current(window)
+
+    # --- ImGui Context and Renderer ---
+    imgui.create_context()
+    impl = GlfwRenderer(window)
+
+    # --- Main Loop ---
+    while not glfw.window_should_close(window):
+        glfw.poll_events()
+        impl.process_inputs()
+
+        imgui.new_frame()
+
+        # --- GUI Definition ---
+        global gui_state
+
+        # Check for updates from processing thread
+        was_processing_last_frame_pyi = gui_state["is_processing"]
+        if was_processing_last_frame_pyi:
+            update_log_and_progress()
+            if gui_state["processing_thread"] and not gui_state["processing_thread"].is_alive():
+                update_log_and_progress()
+                gui_state["is_processing"] = False
+                gui_state["processing_thread"] = None
+                if gui_state["progress"] < 1.0 and gui_state["progress"] >= 0:
+                     gui_state["log_messages"].append("Warning: Processing ended prematurely.")
+                     gui_state["progress"] = 0.0
+
+        # NO imgui.set_next_window_size or imgui.begin here
+
+        # --- Input Folder ---
+        imgui.push_item_width(-200)
+        changed, gui_state["input_dir"] = imgui.input_text("##InputFolder", gui_state["input_dir"], 2048)
+        imgui.pop_item_width()
+        imgui.same_line()
+        if imgui.button("Select Input Folder"):
+            selected = select_folder_dialog()
+            if selected:
+                gui_state["input_dir"] = selected
+
+        # --- Output Filename ---
+        imgui.push_item_width(-150)
+        changed, gui_state["output_filename"] = imgui.input_text("Output Filename", gui_state["output_filename"], 256)
+        imgui.pop_item_width()
+        if imgui.is_item_hovered():
+             imgui.set_tooltip("Filename for the output PNG image (saved in input folder).")
+
+
+        imgui.separator()
+        # --- Configuration Options ---
+        imgui.text("Configuration:")
+
+        changed, gui_state["apply_boundary_smoothing"] = imgui.checkbox("Apply Tile Boundary Smoothing", gui_state["apply_boundary_smoothing"])
+        if imgui.is_item_hovered():
+             imgui.set_tooltip("Averages pixels at the boundaries of the 7x7 tiles.")
+
+        # --- ADDED Radio Buttons for Sector Suffix ---
+        imgui.separator()
+        imgui.text("Sector Type Suffix:")
+        if imgui.radio_button("B0 Sectors (_B0)", gui_state["sector_suffix_type"] == "B0"):
+             gui_state["sector_suffix_type"] = "B0"
+        if imgui.is_item_hovered(): imgui.set_tooltip("Search for sector files like 001_001_B0.sector")
+        imgui.same_line()
+        if imgui.radio_button("D1 Sectors (_D1)", gui_state["sector_suffix_type"] == "D1"):
+             gui_state["sector_suffix_type"] = "D1"
+        if imgui.is_item_hovered(): imgui.set_tooltip("Search for sector files like 001_001_D1.sector")
+        imgui.same_line()
+        if imgui.radio_button("d2 Sectors (_d2)", gui_state["sector_suffix_type"] == "d2"):
+             gui_state["sector_suffix_type"] = "d2"
+        if imgui.is_item_hovered(): imgui.set_tooltip("Search for sector files like 001_001_d2.sector")
+        imgui.separator()
+        # --- End Radio Buttons ---
+
 
         imgui.push_item_width(100)
         # Using lists for input_int/float in pyimgui
@@ -990,16 +1025,14 @@ def run_gui_pyimgui():
         button_needs_disabling_pyi = gui_state["is_processing"]
 
         # Conditionally push style/flags *just before* the button
-        # Prefer public API if available
         use_begin_disabled_pyi = hasattr(imgui, "begin_disabled")
         if button_needs_disabling_pyi:
             if use_begin_disabled_pyi:
                 imgui.begin_disabled(True)
             else:
-                try: # Fallback to internal flags if begin_disabled not present
+                try: # Fallback to internal flags
                     imgui.internal.push_item_flag(imgui.ITEM_DISABLED, True)
-                except AttributeError: pass # Ignore if not available
-            # Still apply alpha for visual cue
+                except AttributeError: pass
             imgui.push_style_var(imgui.STYLE_ALPHA, imgui.get_style().alpha * 0.5)
 
         # Render the button widget AND store its clicked state
@@ -1007,24 +1040,21 @@ def run_gui_pyimgui():
 
         # Conditionally pop style/flags *immediately after* the button
         if button_needs_disabling_pyi:
-             # Pop the style variable first (LIFO)
              imgui.pop_style_var()
-             # End disabled block or pop flag
              if use_begin_disabled_pyi:
                  imgui.end_disabled()
              else:
                  try: # Pop flag if internal push was used
                      imgui.internal.pop_item_flag()
-                 except AttributeError: pass # Ignore if not available/needed
+                 except AttributeError: pass
 
         # Now, handle the button click *after* the stack is potentially restored
         if button_clicked_pyi:
-             # Only start if not already processing
              if not gui_state["is_processing"]:
-                 # Start processing thread (same logic as imgui-bundle version)
                  gui_state["is_processing"] = True
                  gui_state["progress"] = 0.0
                  gui_state["log_messages"] = ["Starting processing..."]
+                 # --- ADDED suffix type to config ---
                  current_config = {
                      'input_dir': gui_state["input_dir"],
                      'output_filename': gui_state["output_filename"],
@@ -1032,7 +1062,9 @@ def run_gui_pyimgui():
                      'sector_overlap': gui_state["sector_overlap"],
                      'boundary_blend_size': gui_state["boundary_blend_size"],
                      'height_scale_factor': gui_state["height_scale_factor"],
+                     'sector_suffix_type': gui_state["sector_suffix_type"], # Pass selected type
                     }
+                 # ---
                  while not gui_state["log_queue"].empty(): gui_state["log_queue"].get()
                  while not gui_state["progress_queue"].empty(): gui_state["progress_queue"].get()
                  gui_state["processing_thread"] = threading.Thread(
@@ -1044,7 +1076,7 @@ def run_gui_pyimgui():
 
         # Render the progress bar (always visible)
         imgui.same_line()
-        imgui.progress_bar(gui_state["progress"], size=(-1, 0)) # pyimgui often uses tuple for size
+        imgui.progress_bar(gui_state["progress"], size=(-1, 0)) # pyimgui often uses tuple
 
         # --- End of Action Button & Progress Section ---
 
@@ -1052,22 +1084,20 @@ def run_gui_pyimgui():
 
         # --- Log Area ---
         imgui.text("Log:")
-        log_height = imgui.get_content_region_available()[1] - 5 # Get Y avail
-        # pyimgui often uses width, height, border args
-        imgui.begin_child("Log", -1, log_height, border=True) # w=-1 means auto
+        log_height = imgui.get_content_region_available()[1] - 5
+        imgui.begin_child("Log", -1, log_height, border=True)
         imgui.text_unformatted("\n".join(gui_state["log_messages"]))
-        # Check for different scroll functions in older pyimgui if needed
         if imgui.get_scroll_y() >= imgui.get_scroll_max_y():
              try:
                  imgui.set_scroll_here_y(1.0)
              except AttributeError:
-                 imgui.set_scroll_here(1.0) # Fallback for older versions
+                 imgui.set_scroll_here(1.0) # Fallback
         imgui.end_child()
 
         # NO imgui.end() here
 
         # --- Rendering ---
-        gl.glClearColor(0.1, 0.1, 0.1, 1) # Background color
+        gl.glClearColor(0.1, 0.1, 0.1, 1)
         gl.glClear(gl.GL_COLOR_BUFFER_BIT)
         imgui.render()
         impl.render(imgui.get_draw_data())
