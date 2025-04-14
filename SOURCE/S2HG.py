@@ -54,7 +54,7 @@ POINTS_PER_TILE = TILE_WIDTH * TILE_HEIGHT
 LAYOUT_SECTOR_WIDTH = 224
 LAYOUT_SECTOR_HEIGHT = 224
 
-# --- Helper Functions (mostly unchanged) ---
+# --- Helper Functions ---
 def parse_filename(filename):
     # Regex should still work fine as it captures digits before the suffix
     match = re.match(r'(\d{3})_(\d{3})_.*\.sector', os.path.basename(filename))
