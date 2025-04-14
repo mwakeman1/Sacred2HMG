@@ -1,3 +1,6 @@
+# --- Old version of the heightmap generator. No UI, relies solely on CLI. This is only here for backup purposes, in case something royally goes wrong as I update my code. 
+# --- Also in case I get bored and forget everything, I commented the hell out of it. 
+
 import struct
 import math
 import os

@@ -2,15 +2,14 @@ Creates a heightmap from Sacred 2 .sector files.
 
 Usage: 
 
-Extract the .sector files from the sector zips, place the script in the same folder as the extracted files, and run from the command prompt. 
+Extract the .sector files from the sector zips.
+Set the directory to your .pak folder and click Generate Heightmap.
 
-Requirements:
-
-Python and various dependencies (will be packaged later).
+Options are availble for blending between the sectors, as well as what should be generated.
 
 Bugs: 
 
-No smoothing between the sectors, so it appears blocky. 
+No smoothing between the sectors, so it appears blocky. This seems to be an issue with the way the sectors are being normalzied, but I honestly have no idea how to fix it.
 
 ![{164BCDF7-ECCE-4279-8671-A744EAD3AA2C}](https://github.com/user-attachments/assets/17c76a41-d128-4d9f-8323-3d4478857415)
 
