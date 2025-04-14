@@ -64,6 +64,8 @@ def create_weight_map(sector_h, sector_w, blend_size):
     return weight_map
 
 def process_sector_base_offset(sector_content_bytes, sector_filename_in_zip, expected_width, expected_height, log_queue):
+    # Note: Cancellation check is not added here as it's very low-level file parsing.
+    # Checks are added in the higher-level loops of generate_heightmap.
     height_offsets = []
     base_h = 0
     header_bytes = None
@@ -146,6 +148,7 @@ def process_sector_base_offset(sector_content_bytes, sector_filename_in_zip, exp
 
 
 def correct_detile_sector(sector_offset_values, sector_width, sector_height, log_queue):
+    # Note: Cancellation check is not added here as it's very low-level.
     detiled_heights = np.zeros((sector_height, sector_width), dtype=np.uint16)
     tiles_per_row = sector_width // TILE_WIDTH
     tiles_per_col = sector_height // TILE_HEIGHT
@@ -179,6 +182,7 @@ def correct_detile_sector(sector_offset_values, sector_width, sector_height, log
     return detiled_heights
 
 def smooth_tile_boundaries(heightmap, tile_width, tile_height, log_queue):
+    # Note: Cancellation check is not added here as it's generally fast.
     if tile_width <= 1 or tile_height <= 1: return heightmap.astype(np.float32)
     height, width = heightmap.shape
     smoothed = heightmap.copy().astype(np.float32)
@@ -196,7 +200,8 @@ def smooth_tile_boundaries(heightmap, tile_width, tile_height, log_queue):
     return smoothed
 
 
-def generate_heightmap(config, log_queue, progress_queue):
+# Modified function signature to accept cancel_event
+def generate_heightmap(config, log_queue, progress_queue, cancel_event):
     final_heightmap_float = None
     try:
         input_dir = config['input_dir']
@@ -220,7 +225,6 @@ def generate_heightmap(config, log_queue, progress_queue):
         if not base_output_name: base_output_name = "heightmap_output"
         output_dir = input_dir
         output_file_path_png = os.path.join(output_dir, base_output_name + ".png")
-        # output_file_path_vis_png = os.path.join(output_dir, base_output_name + "_enhanced_vis.png") # Removed enhanced vis definition
 
         log_queue.put("--- Starting Heightmap Generation ---")
         log_queue.put(f"Input Folder: {input_dir}"); log_queue.put(f"Output Base Name: {base_output_name}")
@@ -229,6 +233,12 @@ def generate_heightmap(config, log_queue, progress_queue):
         log_queue.put(f"Formula: H = base + (offset / {height_scale_factor})"); log_queue.put("Norm: Global Min/Max -> 0-255 PNG")
 
         progress_queue.put(0.0)
+
+        # Check for cancellation before starting expensive operations
+        if cancel_event.is_set():
+            log_queue.put("--- Processing Cancelled by User (Before Start) ---")
+            progress_queue.put(-1.0)
+            return None
 
         if sector_suffix_type == "B0": required_suffix = "_b0.sector"
         elif sector_suffix_type == "D1": required_suffix = "_d1.sector"
@@ -252,6 +262,12 @@ def generate_heightmap(config, log_queue, progress_queue):
         sectors_data = {}; all_coords = []; processed_count = 0; total_archives = len(all_archives)
 
         for archive_idx, archive_filepath in enumerate(all_archives):
+            # Check for cancellation at the start of each archive processing
+            if cancel_event.is_set():
+                log_queue.put("--- Processing Cancelled by User (During Pass 1) ---")
+                progress_queue.put(-1.0)
+                return None
+
             archive_filename = os.path.basename(archive_filepath)
             log_queue.put(f" -> Archive: {archive_filename} ({archive_idx+1}/{total_archives})")
             processed_in_archive = 0
@@ -261,7 +277,13 @@ def generate_heightmap(config, log_queue, progress_queue):
                     sector_members = [ name for name in member_names if name.lower().endswith(required_suffix.lower()) ]
                     if not sector_members: log_queue.put(f"    No sectors matching '{required_suffix}' found."); continue
 
-                    for sector_name_in_zip in sector_members:
+                    for sector_idx, sector_name_in_zip in enumerate(sector_members):
+                        # Optional: Check more frequently within large archives
+                        if sector_idx % 20 == 0 and cancel_event.is_set(): # Check every 20 sectors
+                             log_queue.put("--- Processing Cancelled by User (During Pass 1 - Sector Read) ---")
+                             progress_queue.put(-1.0)
+                             return None
+
                         filename_short = os.path.basename(sector_name_in_zip)
                         sx, sy = parse_filename(filename_short)
                         if sx is None or sy is None: log_queue.put(f"    W: Skip '{filename_short}', parse fail."); continue
@@ -276,6 +298,7 @@ def generate_heightmap(config, log_queue, progress_queue):
                                     log_queue.put(f"    W: Skip '{filename_short}', dim mismatch ({w}x{h})."); continue
                                 detiled_offsets_uint16 = correct_detile_sector(height_offsets, w, h, log_queue)
                                 if detiled_offsets_uint16 is not None:
+                                    # No cancel check needed here, very fast operation
                                     log_queue.put(f"    OK: Processed {filename_short} ({sx},{sy}) BaseH={base_h}")
                                     sectors_data[(sx, sy)] = {'detiled_offsets': detiled_offsets_uint16, 'base_h': base_h, 'width': w, 'height': h}
                                     all_coords.append((sx, sy)); processed_count += 1; processed_in_archive += 1
@@ -291,6 +314,12 @@ def generate_heightmap(config, log_queue, progress_queue):
         if processed_count == 0:
             log_queue.put(f"Error: No valid sector data found matching suffix '{required_suffix}'.");
             progress_queue.put(-1.0); return None
+
+        # Check for cancellation before allocating large memory
+        if cancel_event.is_set():
+             log_queue.put("--- Processing Cancelled by User (Before Pass 2) ---")
+             progress_queue.put(-1.0)
+             return None
 
         min_sx=min(c[0] for c in all_coords); max_sx=max(c[0] for c in all_coords)
         min_sy=min(c[1] for c in all_coords); max_sy=max(c[1] for c in all_coords)
@@ -339,6 +368,14 @@ def generate_heightmap(config, log_queue, progress_queue):
         if static_weight_map is None: log_queue.put("E: Failed to create weight map."); progress_queue.put(-1.0); return None
 
         for i, ((sx, sy), data) in enumerate(sectors_data.items()):
+             # Check for cancellation periodically during Pass 2
+            if i % 10 == 0 and cancel_event.is_set(): # Check every 10 sectors blended
+                log_queue.put("--- Processing Cancelled by User (During Pass 2) ---")
+                progress_queue.put(-1.0)
+                # Clean up potentially large arrays before returning
+                del heightmap_sum_array, weight_sum_array, static_weight_map
+                return None
+
             sector_w = data['width']; sector_h = data['height']
             local_base_h = data.get('base_h', global_base)
             absolute_height_sector_float64 = (data['detiled_offsets'].astype(np.float64) / height_scale_factor) + local_base_h
@@ -385,6 +422,14 @@ def generate_heightmap(config, log_queue, progress_queue):
         log_queue.put(f"Pass 2 Done. Blended {placed_count} sectors.")
         if placed_count == 0: log_queue.put("E: No sectors placed."); progress_queue.put(-1.0); return None
 
+        # Check for cancellation before final processing/saving
+        if cancel_event.is_set():
+             log_queue.put("--- Processing Cancelled by User (Before Pass 3) ---")
+             progress_queue.put(-1.0)
+             # Clean up potentially large arrays before returning
+             del heightmap_sum_array, weight_sum_array, static_weight_map
+             return None
+
         log_queue.put("--- Pass 3: Finalizing map and saving outputs ---")
         if not first_sector_processed or not np.isfinite(overall_min_h) or not np.isfinite(overall_max_h):
              log_queue.put("W: No valid overall height range found across sectors. Calculating from sum...")
@@ -424,11 +469,16 @@ def generate_heightmap(config, log_queue, progress_queue):
         progress_queue.put(0.95)
 
         try:
+             # Check for cancellation one last time before saving
+            if cancel_event.is_set():
+                 log_queue.put("--- Processing Cancelled by User (Before Save) ---")
+                 progress_queue.put(-1.0)
+                 del final_heightmap_float, heightmap_8bit # Clean up
+                 return None
+
             log_queue.put(f"Saving normalized heightmap PNG to {os.path.basename(output_file_path_png)}...")
             img = Image.fromarray(heightmap_8bit, mode='L')
             img.save(output_file_path_png)
-
-            # Removed enhanced vis saving block
 
             log_queue.put("\n--- Processing Complete ---")
             log_queue.put(f"Outputs saved with base name: {base_output_name}")
@@ -438,6 +488,9 @@ def generate_heightmap(config, log_queue, progress_queue):
 
         except Exception as e:
             log_queue.put(f"\nE: Saving final image: {e}"); traceback.print_exc(); progress_queue.put(-1.0)
+            # Check if cancel was requested during save attempt (less likely but possible)
+            if cancel_event.is_set():
+                log_queue.put("--- NOTE: Cancellation was also requested around save time ---")
             return None
 
         return final_heightmap_float
@@ -446,5 +499,8 @@ def generate_heightmap(config, log_queue, progress_queue):
         log_queue.put(f"\n--- UNEXPECTED ERROR in generate_heightmap ---")
         log_queue.put(f"Error: {e}")
         log_queue.put(traceback.format_exc())
+        # Check if cancel was requested during the error
+        if cancel_event and cancel_event.is_set():
+             log_queue.put("--- NOTE: Cancellation was also requested around error time ---")
         progress_queue.put(-1.0)
         return None
