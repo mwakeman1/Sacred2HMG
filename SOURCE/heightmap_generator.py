@@ -1,25 +1,14 @@
-# heightmap_generator.py
-"""
-Contains the core logic for reading Sacred 2 sector files,
-processing the height data, and stitching them into a final heightmap array.
-Does not contain GUI elements.
-"""
-
 import struct
 import math
 import os
-import cv2       # For saving enhanced vis PNG
+# import cv2 # Removed import
 import glob
 import re
 import numpy as np
-from PIL import Image # For saving standard PNG
+from PIL import Image
 import zipfile
 import traceback
-# No Queue import needed here; queues are passed *in* from the caller.
 
-
-# --- Configuration Defaults / Constants ---
-# (These relate specifically to the file format and processing)
 ENTRY_SIZE = 8
 HEIGHT_OFFSET_IN_ENTRY = 6
 HEIGHT_FORMAT = '<H'
@@ -37,9 +26,7 @@ POINTS_PER_TILE = TILE_WIDTH * TILE_HEIGHT
 LAYOUT_SECTOR_WIDTH = 224
 LAYOUT_SECTOR_HEIGHT = 224
 
-# --- Helper Functions ---
 def parse_filename(filename):
-    """ Extracts sector coordinates (sx, sy) from filename. """
     match = re.match(r'(\d{3})_(\d{3})_.*\.sector', os.path.basename(filename))
     if match:
         return int(match.group(1)), int(match.group(2))
@@ -47,15 +34,13 @@ def parse_filename(filename):
         return None, None
 
 def create_weight_map(sector_h, sector_w, blend_size):
-    """ Creates a weight map for blending sector edges. """
     weight_map = np.ones((sector_h, sector_w), dtype=np.float32)
     if blend_size <= 0: return weight_map
     blend_pixels = min(blend_size, sector_w // 2, sector_h // 2)
     if blend_pixels <= 0: return weight_map
-    # Smoother cosine-like ramp (from 1 down to 0)
     x_blend = np.linspace(0., np.pi / 2., blend_pixels + 1)[1:]
-    ramp = (np.cos(x_blend) ** 2) # Smoothstep-like curve: 1 at edge, 0 after blend_pixels
-    ramp = ramp[::-1] # Invert: 0 at edge, 1 after blend_pixels
+    ramp = (np.cos(x_blend) ** 2)
+    ramp = ramp[::-1]
     center_start = blend_pixels
     center_end_y = sector_h - blend_pixels
     center_end_x = sector_w - blend_pixels
@@ -79,7 +64,6 @@ def create_weight_map(sector_h, sector_w, blend_size):
     return weight_map
 
 def process_sector_base_offset(sector_content_bytes, sector_filename_in_zip, expected_width, expected_height, log_queue):
-    """ Reads base height and raw height offsets from sector byte content. """
     height_offsets = []
     base_h = 0
     header_bytes = None
@@ -139,17 +123,15 @@ def process_sector_base_offset(sector_content_bytes, sector_filename_in_zip, exp
             entry_offset_in_data = i * ENTRY_SIZE
             entry_bytes = data_block_bytes[entry_offset_in_data : entry_offset_in_data + ENTRY_SIZE]
             if len(entry_bytes) < ENTRY_SIZE:
-                 log_queue.put(f" E:{filename_short} Unexpected short read at vertex {i+1}/{expected_vertices} (internal error).")
-                 return None, None, None, None, None, None
+                   log_queue.put(f" E:{filename_short} Unexpected short read at vertex {i+1}/{expected_vertices} (internal error).")
+                   return None, None, None, None, None, None
             try:
-                # Allow non-zero bytes but log warning
                 if not all(entry_bytes[z] == 0x00 for z in EXPECTED_ZERO_BYTES_OFFSETS):
                       log_queue.put(f" W:{filename_short} Entry {i} failed zero byte check {entry_bytes[2:6].hex()}. Using offset anyway.")
                 h_val, = struct.unpack_from(HEIGHT_FORMAT, entry_bytes, HEIGHT_OFFSET_IN_ENTRY)
                 height_offsets.append(h_val)
             except struct.error as e:
                 log_queue.put(f" W:{filename_short} Struct error unpacking uint16 offset at vertex {i}: {e}")
-                # Skip this vertex? Return None? Let's return None for safety.
                 return None, None, None, None, None, None
         if len(height_offsets) != expected_vertices:
             log_queue.put(f" E:{filename_short} Read count mismatch ({len(height_offsets)} vs {expected_vertices}).")
@@ -164,7 +146,6 @@ def process_sector_base_offset(sector_content_bytes, sector_filename_in_zip, exp
 
 
 def correct_detile_sector(sector_offset_values, sector_width, sector_height, log_queue):
-    """ Reorganizes linear height offsets into a 2D grid based on 7x7 tiling. """
     detiled_heights = np.zeros((sector_height, sector_width), dtype=np.uint16)
     tiles_per_row = sector_width // TILE_WIDTH
     tiles_per_col = sector_height // TILE_HEIGHT
@@ -198,19 +179,15 @@ def correct_detile_sector(sector_offset_values, sector_width, sector_height, log
     return detiled_heights
 
 def smooth_tile_boundaries(heightmap, tile_width, tile_height, log_queue):
-    """ Optional smoothing of internal 7x7 tile boundaries within a sector. """
     if tile_width <= 1 or tile_height <= 1: return heightmap.astype(np.float32)
     height, width = heightmap.shape
     smoothed = heightmap.copy().astype(np.float32)
-    # Horizontal boundaries
     for x in range(tile_width - 1, width - 1, tile_width):
         if x > 0 and x < width - 1:
              smoothed[:, x] = (smoothed[:, x - 1] + smoothed[:, x + 1]) / 2.0
-    # Vertical boundaries
     for y in range(tile_height - 1, height - 1, tile_height):
         if y > 0 and y < height - 1:
              smoothed[y, :] = (smoothed[y - 1, :] + smoothed[y + 1, :]) / 2.0
-    # Corner points
     for y in range(tile_height - 1, height - 1, tile_height):
         for x in range(tile_width - 1, width - 1, tile_width):
             if y > 0 and y < height - 1 and x > 0 and x < width - 1:
@@ -220,41 +197,30 @@ def smooth_tile_boundaries(heightmap, tile_width, tile_height, log_queue):
 
 
 def generate_heightmap(config, log_queue, progress_queue):
-    """
-    Main function to generate the heightmap.
-    Processes sector files found within ZIP/PAK archives based on config.
-    Communicates progress and logs via provided queues.
-    Returns the final float heightmap array on success, None on failure.
-    """
-    final_heightmap_float = None # Initialize return value
+    final_heightmap_float = None
     try:
-        # --- Configuration Extraction ---
         input_dir = config['input_dir']
-        output_filename = config['output_filename'] # Base name used for outputs
+        output_filename = config['output_filename']
         apply_boundary_smoothing = config['apply_boundary_smoothing']
         sector_overlap = config['sector_overlap']
         boundary_blend_size = config['boundary_blend_size']
         height_scale_factor = config['height_scale_factor']
         sector_suffix_type = config['sector_suffix_type']
 
-        # --- Initial Validation & Setup ---
         if not input_dir or not os.path.isdir(input_dir):
             log_queue.put("Error: Input directory is not valid."); progress_queue.put(-1.0); return None
         try:
             height_scale_factor = float(height_scale_factor)
-            if height_scale_factor <= 1e-6: # Check for near zero as well
+            if height_scale_factor <= 1e-6:
                 raise ValueError("Height Scale Factor must be significantly > 0.")
         except ValueError as e:
              log_queue.put(f"Error: Invalid Height Scale Factor ({e})."); progress_queue.put(-1.0); return None
 
         base_output_name, _ = os.path.splitext(output_filename)
         if not base_output_name: base_output_name = "heightmap_output"
-        # Define output paths based on input dir and base name
-        output_dir = input_dir # Save outputs in the same folder as inputs
+        output_dir = input_dir
         output_file_path_png = os.path.join(output_dir, base_output_name + ".png")
-        output_file_path_npy = os.path.join(output_dir, base_output_name + ".npy")
-        output_file_path_raw_npy = os.path.join(output_dir, base_output_name + "_raw.npy")
-        output_file_path_vis_png = os.path.join(output_dir, base_output_name + "_enhanced_vis.png")
+        # output_file_path_vis_png = os.path.join(output_dir, base_output_name + "_enhanced_vis.png") # Removed enhanced vis definition
 
         log_queue.put("--- Starting Heightmap Generation ---")
         log_queue.put(f"Input Folder: {input_dir}"); log_queue.put(f"Output Base Name: {base_output_name}")
@@ -264,7 +230,6 @@ def generate_heightmap(config, log_queue, progress_queue):
 
         progress_queue.put(0.0)
 
-        # --- Sector Discovery ---
         if sector_suffix_type == "B0": required_suffix = "_b0.sector"
         elif sector_suffix_type == "D1": required_suffix = "_d1.sector"
         else: required_suffix = "_d2.sector"
@@ -274,7 +239,7 @@ def generate_heightmap(config, log_queue, progress_queue):
         try:
             all_archives.extend(glob.glob(os.path.join(input_dir, '*.zip')))
             all_archives.extend(glob.glob(os.path.join(input_dir, '*.pak')))
-            all_archives = sorted(list(set(all_archives))) # Sort for consistent order
+            all_archives = sorted(list(set(all_archives)))
         except Exception as e:
             log_queue.put(f"Error searching for archives: {e}"); progress_queue.put(-1.0); return None
 
@@ -282,7 +247,6 @@ def generate_heightmap(config, log_queue, progress_queue):
         if not all_archives:
             log_queue.put("Error: No .zip or .pak archives found."); progress_queue.put(-1.0); return None
 
-        # --- Pass 1: Reading sector data ---
         log_queue.put(f"Sector Grid Size (Expected): {LAYOUT_SECTOR_WIDTH} x {LAYOUT_SECTOR_HEIGHT}")
         log_queue.put("--- Pass 1: Reading sector data from Archives ---")
         sectors_data = {}; all_coords = []; processed_count = 0; total_archives = len(all_archives)
@@ -321,14 +285,13 @@ def generate_heightmap(config, log_queue, progress_queue):
             except zipfile.BadZipFile: log_queue.put(f" W: Skipping bad archive: {archive_filename}")
             except Exception as zip_e: log_queue.put(f" E: Error with archive {archive_filename}: {zip_e}")
             if processed_in_archive > 0: log_queue.put(f"    -> Found {processed_in_archive} valid sectors.")
-            progress_queue.put(0.3 * (archive_idx + 1) / total_archives) # Update progress
+            progress_queue.put(0.3 * (archive_idx + 1) / total_archives)
 
         log_queue.put(f"Pass 1 Done. Processed {processed_count} unique sectors.")
         if processed_count == 0:
             log_queue.put(f"Error: No valid sector data found matching suffix '{required_suffix}'.");
             progress_queue.put(-1.0); return None
 
-        # --- Calculate Final Dimensions & Allocate Arrays ---
         min_sx=min(c[0] for c in all_coords); max_sx=max(c[0] for c in all_coords)
         min_sy=min(c[1] for c in all_coords); max_sy=max(c[1] for c in all_coords)
         log_queue.put(f"Coord Range: X=[{min_sx}-{max_sx}], Y=[{min_sy}-{max_sy}]")
@@ -364,7 +327,6 @@ def generate_heightmap(config, log_queue, progress_queue):
         except Exception as e:
              log_queue.put(f"E: Numpy array error: {e}"); progress_queue.put(-1.0); return None
 
-        # --- Pass 2: Calculate absolute heights, smoothing, blending ---
         valid_base_heights = [data['base_h'] for data in sectors_data.values() if 'base_h' in data and data['base_h'] is not None]
         global_base = np.mean(valid_base_heights) if valid_base_heights else 0.0
         log_queue.put(f"Global Avg Base Height: {global_base:.2f}")
@@ -423,7 +385,6 @@ def generate_heightmap(config, log_queue, progress_queue):
         log_queue.put(f"Pass 2 Done. Blended {placed_count} sectors.")
         if placed_count == 0: log_queue.put("E: No sectors placed."); progress_queue.put(-1.0); return None
 
-        # --- Pass 3: Finalizing map and saving outputs ---
         log_queue.put("--- Pass 3: Finalizing map and saving outputs ---")
         if not first_sector_processed or not np.isfinite(overall_min_h) or not np.isfinite(overall_max_h):
              log_queue.put("W: No valid overall height range found across sectors. Calculating from sum...")
@@ -442,18 +403,8 @@ def generate_heightmap(config, log_queue, progress_queue):
         final_heightmap_float = np.full((final_height, final_width), np.nan, dtype=np.float32)
         valid_weights_mask = weight_sum_array > 1e-9
         np.divide(heightmap_sum_array, weight_sum_array, out=final_heightmap_float, where=valid_weights_mask)
-        del heightmap_sum_array, weight_sum_array # Clean up memory
+        del heightmap_sum_array, weight_sum_array
 
-        # --- Save NPY files ---
-        log_queue.put(f"Saving raw float map (float32) to {os.path.basename(output_file_path_raw_npy)}...")
-        try: np.save(output_file_path_raw_npy, final_heightmap_float)
-        except Exception as e: log_queue.put(f"Error saving raw NPY: {e}")
-
-        log_queue.put(f"Saving processed float map (float32) to {os.path.basename(output_file_path_npy)}...")
-        try: np.save(output_file_path_npy, final_heightmap_float) # Currently same as raw
-        except Exception as e: log_queue.put(f"Error saving processed NPY: {e}")
-
-        # --- Normalize and Save PNG files ---
         log_queue.put("Normalizing heightmap for PNG output...")
         norm_min = overall_min_h; norm_max = overall_max_h
         log_queue.put(f"Norm Range Used (PNG): [{norm_min:.2f}, {norm_max:.2f}] -> [0, 255]")
@@ -477,23 +428,18 @@ def generate_heightmap(config, log_queue, progress_queue):
             img = Image.fromarray(heightmap_8bit, mode='L')
             img.save(output_file_path_png)
 
-            log_queue.put(f"Saving visually enhanced PNG to {os.path.basename(output_file_path_vis_png)}...")
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            enhanced_vis = clahe.apply(heightmap_8bit)
-            cv2.imwrite(output_file_path_vis_png, enhanced_vis)
+            # Removed enhanced vis saving block
 
             log_queue.put("\n--- Processing Complete ---")
             log_queue.put(f"Outputs saved with base name: {base_output_name}")
             log_queue.put(f"Final map size: {final_width} x {final_height}")
-            log_queue.put(f"Float Height Range (NPY): [{overall_min_h:.2f}, {overall_max_h:.2f}]")
             log_queue.put(f"PNG Normalization Applied: [{norm_min:.2f}, {norm_max:.2f}] -> [0, 255]")
             progress_queue.put(1.0)
 
         except Exception as e:
             log_queue.put(f"\nE: Saving final image: {e}"); traceback.print_exc(); progress_queue.put(-1.0)
-            return None # Return None on saving error
+            return None
 
-        # Return the generated heightmap data on success
         return final_heightmap_float
 
     except Exception as e:
@@ -501,10 +447,4 @@ def generate_heightmap(config, log_queue, progress_queue):
         log_queue.put(f"Error: {e}")
         log_queue.put(traceback.format_exc())
         progress_queue.put(-1.0)
-        return None # Return None on major error
-
-# Add a check for top-level assignments (DEBUGGING)
-# This code runs when the module is imported
-# print(f"DEBUG: At end of heightmap_generator.py, generate_heightmap is: {generate_heightmap}")
-# if 'generate_heightmap' in locals() and generate_heightmap is None:
-#    print("CRITICAL DEBUG: generate_heightmap became None at the end of heightmap_generator.py!")
+        return None
