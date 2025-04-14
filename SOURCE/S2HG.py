@@ -12,12 +12,11 @@ import time
 from queue import Queue  # For thread-safe communication
 import zipfile         # Keep this import
 
-# --- ImGui / GUI specific imports ---
+# --- GUI specific imports ---
 # Use tkinter for the folder dialog as it's often built-in
 import tkinter as tk
 from tkinter import filedialog
 
-# Use imgui-bundle for easier setup
 try:
     # Use newer API if available
     import imgui_bundle
@@ -32,10 +31,7 @@ except ImportError:
     import OpenGL.GL as gl
     IMGUI_BACKEND = "pyimgui"
 
-
-# --- Core Processing Logic (slightly modified from original) ---
-
-# --- Configuration Defaults (will be controlled by UI) ---
+# --- Configuration Defaults ---
 # These remain constants as they describe the file format
 ENTRY_SIZE = 8
 HEIGHT_OFFSET_IN_ENTRY = 6  # Offset within the entry (uint16)
@@ -107,7 +103,7 @@ def create_weight_map(sector_h, sector_w, blend_size):
         weight_map[center_start:center_end_y, center_start:center_end_x] = 1.0
     return weight_map
 
-# --- MODIFIED Function Signature and Internal Logic ---
+# --- Function Signature and Internal Logic ---
 def process_sector_base_offset(sector_content_bytes, sector_filename_in_zip, expected_width, expected_height, log_queue):
     """Reads int16 base (Hdr@2) and uint16 offsets (Entry@6) from sector file content bytes."""
     height_offsets = []
@@ -311,7 +307,7 @@ def smooth_tile_boundaries(heightmap, tile_width, tile_height, log_queue):
     for x in range(tile_width - 1, width - 1, tile_width):
         h_boundary_mask[:, x] = True
 
-    # Mark vertical boundaries (excluding image edges)
+    # Mark vertical boundaries (excluding image edges) (this may be what's causng the black lines with higher a higher blend range)
     for y in range(tile_height - 1, height - 1, tile_height):
         v_boundary_mask[y, :] = True
 
@@ -351,7 +347,7 @@ def smooth_tile_boundaries(heightmap, tile_width, tile_height, log_queue):
 
     return smoothed
 
-# --- MODIFIED Main Processing Function ---
+# --- Main Processing Function ---
 def generate_heightmap(config, log_queue, progress_queue):
     """
     Processes sector files found within ZIP archives based on config and updates GUI via queues.
@@ -376,7 +372,6 @@ def generate_heightmap(config, log_queue, progress_queue):
              progress_queue.put(-1.0)
              return
         height_scale_factor = float(height_scale_factor)
-        # ---
 
         output_file_path = os.path.join(input_dir, output_filename)
 
@@ -399,7 +394,6 @@ def generate_heightmap(config, log_queue, progress_queue):
         else: # Assume d2
             required_suffix = "_d2.sector"
         log_queue.put(f"Searching for sectors ending with: '{required_suffix}' (case-insensitive)")
-        # ---
 
         # --- Find ZIP files ---
         all_zip_files = glob.glob(os.path.join(input_dir, '*.zip'))
@@ -408,10 +402,11 @@ def generate_heightmap(config, log_queue, progress_queue):
             log_queue.put("Error: No .zip files found in the specified directory.")
             progress_queue.put(-1.0) # Indicate error
             return
-        # ---
 
         log_queue.put(f"Using fixed layout size: {LAYOUT_SECTOR_WIDTH} x {LAYOUT_SECTOR_HEIGHT}")
-
+        
+        # --- MAIN HEIGHTMAP FUNCTION: START ---
+        
         # --- Pass 1: Read Header Base and Entry Offsets from sectors within Zips ---
         log_queue.put("--- Pass 1: Reading sector data from ZIPs ---")
         sectors_data = {}
@@ -427,12 +422,10 @@ def generate_heightmap(config, log_queue, progress_queue):
                 with zipfile.ZipFile(zip_filepath, 'r') as zf:
                     # Get names of all files within the zip
                     member_names = zf.namelist()
-                    # --- MODIFIED FILTER ---
                     sector_members = [
                         name for name in member_names
                         if name.lower().endswith(required_suffix) # Use the required suffix
                     ]
-                    # --- END MODIFIED FILTER ---
 
                     if not sector_members:
                         log_queue.put(f"    No sectors matching '{required_suffix}' found in {zip_filename}")
@@ -512,14 +505,14 @@ def generate_heightmap(config, log_queue, progress_queue):
             progress_queue.put(-1.0) # Error
             return
 
-        # --- Determine Map Bounds (remains the same) ---
+        # --- Determine Map Bounds ---
         min_sx = min(c[0] for c in all_coords)
         max_sx = max(c[0] for c in all_coords)
         min_sy = min(c[1] for c in all_coords)
         max_sy = max(c[1] for c in all_coords)
         log_queue.put(f"Determined Sector Coordinate Range: X=[{min_sx}-{max_sx}], Y=[{min_sy}-{max_sy}]")
 
-        # --- Calculate Final Map Size (remains the same) ---
+        # --- Calculate Final Map Size ---
         current_overlap = sector_overlap
         max_possible_overlap = min(LAYOUT_SECTOR_WIDTH, LAYOUT_SECTOR_HEIGHT) -1
         if not (0 <= current_overlap <= max_possible_overlap) :
@@ -545,9 +538,8 @@ def generate_heightmap(config, log_queue, progress_queue):
             log_queue.put("Error: Calculated final map dimensions are zero or negative.")
             progress_queue.put(-1.0) # Error
             return
-        # ---
 
-        # --- Allocate Memory (remains the same) ---
+        # --- Allocate Memory  ---
         try:
             log_queue.put(f"Allocating final map arrays ({final_height} x {final_width})...")
             heightmap_sum_array = np.zeros((final_height, final_width), dtype=np.float64)
@@ -558,9 +550,8 @@ def generate_heightmap(config, log_queue, progress_queue):
              progress_queue.put(-1.0); return
         except Exception as e:
              log_queue.put(f"Error creating numpy arrays: {e}"); progress_queue.put(-1.0); return
-        # ---
 
-        # --- Global Base Correction (remains the same) ---
+        # --- Global Base Correction ---
         base_sum = 0.0
         base_count = 0
         for data in sectors_data.values():
@@ -569,7 +560,6 @@ def generate_heightmap(config, log_queue, progress_queue):
         if base_count > 0: global_base = base_sum / base_count
         else: global_base = 0.0; log_queue.put("W: Could not compute global average base...")
         log_queue.put(f"Global average base computed: {global_base:.2f} from {base_count} sectors.")
-        # ---
 
         # --- Pass 2: Calculate Height, Smooth (Optional), and Blend (remains the same) ---
         log_queue.put("--- Pass 2: Calculating heights, smoothing, and blending ---")
@@ -625,7 +615,7 @@ def generate_heightmap(config, log_queue, progress_queue):
             progress_queue.put(-1.0) # Error
             return
 
-        # --- Pass 3: Finalize Map (Divide by weights and Normalize) (remains the same) ---
+        # --- Pass 3: Finalize Map (Divide by weights and Normalize) ---
         log_queue.put("--- Pass 3: Finalizing map and normalizing ---")
         if not first_sector_processed or not np.isfinite(overall_min_h) or not np.isfinite(overall_max_h):
             log_queue.put(" W: No valid finite height range found...") # Handle as before
@@ -656,7 +646,7 @@ def generate_heightmap(config, log_queue, progress_queue):
 
         progress_queue.put(0.95) # Almost done
 
-        # --- Save the Final Image (remains the same) ---
+        # --- Save the Final Image ---
         try:
             log_queue.put(f"Saving final heightmap to {output_file_path}...")
             img = Image.fromarray(heightmap_8bit, mode='L')
@@ -752,7 +742,7 @@ def run_gui_imgui_bundle():
                      gui_state["log_messages"].append("Warning: Processing ended prematurely.")
                      gui_state["progress"] = 0.0
 
-        # NO imgui.set_next_window_size or imgui.begin here
+        # NO imgui.set_next_window_size or imgui.begin here, idk I couldn't get it working.
 
         # --- Input Folder ---
         imgui.push_item_width(-200)
@@ -780,7 +770,7 @@ def run_gui_imgui_bundle():
         if imgui.is_item_hovered():
              imgui.set_tooltip("Averages pixels at the boundaries of the 7x7 tiles.")
 
-        # --- ADDED Radio Buttons for Sector Suffix ---
+        # --- Radio Buttons for Sector Suffix ---
         imgui.separator()
         imgui.text("Sector Type Suffix:")
         clicked_b0 = imgui.radio_button("B0 Sectors (_B0)", gui_state["sector_suffix_type"] == "B0")
@@ -947,7 +937,7 @@ def run_gui_pyimgui():
                      gui_state["log_messages"].append("Warning: Processing ended prematurely.")
                      gui_state["progress"] = 0.0
 
-        # NO imgui.set_next_window_size or imgui.begin here
+        # NO imgui.set_next_window_size or imgui.begin here -- same as before. 
 
         # --- Input Folder ---
         imgui.push_item_width(-200)
@@ -975,7 +965,7 @@ def run_gui_pyimgui():
         if imgui.is_item_hovered():
              imgui.set_tooltip("Averages pixels at the boundaries of the 7x7 tiles.")
 
-        # --- ADDED Radio Buttons for Sector Suffix ---
+        # --- Radio Buttons for Sector Suffix ---
         imgui.separator()
         imgui.text("Sector Type Suffix:")
         if imgui.radio_button("B0 Sectors (_B0)", gui_state["sector_suffix_type"] == "B0"):
