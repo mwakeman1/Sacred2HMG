@@ -9,7 +9,7 @@ Options are availble for blending between the sectors, as well as what should be
 
 Bugs: 
 
-No smoothing between the sectors, so it appears blocky. 
+No smoothing between the sectors, so it appears blocky. This seems to be an issue with the way the sectors are being normalzied, but I honestly have no idea how to fix it.
 
 ![{164BCDF7-ECCE-4279-8671-A744EAD3AA2C}](https://github.com/user-attachments/assets/17c76a41-d128-4d9f-8323-3d4478857415)
 
