@@ -1,3 +1,12 @@
+# --- Heightmap Generator ---
+# This script reads the sector files in the /pak directory of Sacred 2's installation folder, interpret's their data, and stitches together a heightmap.
+# There are several constants: size, location, offsets, format (16-bit unsigned integer) and byte sequence.
+# Sacred 2 generates it's tiles in 7x7 squares, which are set in rows of 32, totalling 49 tiles (224x224 pixels). 
+# In pass 1 it reads, processes, and stores each sector in a 2d height offset array. 
+# In pass 2 it allocates NumPy arrays (using 64-bit floats for precision) to hold the summed weight heighs and weight.
+# Pass 2 also interates through the sector, calculating absolute floating-point height (base height + offset / scale factor). 
+# In pass 3 it calculates the final height for each pixel by dividing the total weighted height sum by the total weight sum. Then it normalizes to 0-255.
+
 import struct
 import math
 import os
