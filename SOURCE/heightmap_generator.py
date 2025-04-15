@@ -1,7 +1,6 @@
 import struct
 import math
 import os
-# import cv2 # Removed import
 import glob
 import re
 import numpy as np
@@ -47,11 +46,11 @@ def create_weight_map(sector_h, sector_w, blend_size):
     for i in range(blend_pixels):
         weight = ramp[i]
         if center_start < center_end_x:
-             weight_map[i, center_start:center_end_x] = weight
-             weight_map[sector_h - 1 - i, center_start:center_end_x] = weight
+              weight_map[i, center_start:center_end_x] = weight
+              weight_map[sector_h - 1 - i, center_start:center_end_x] = weight
         if center_start < center_end_y:
-             weight_map[center_start:center_end_y, i] = weight
-             weight_map[center_start:center_end_y, sector_w - 1 - i] = weight
+              weight_map[center_start:center_end_y, i] = weight
+              weight_map[center_start:center_end_y, sector_w - 1 - i] = weight
     for r in range(blend_pixels):
         for c in range(blend_pixels):
             weight_corner = min(ramp[r], ramp[c])
@@ -64,8 +63,6 @@ def create_weight_map(sector_h, sector_w, blend_size):
     return weight_map
 
 def process_sector_base_offset(sector_content_bytes, sector_filename_in_zip, expected_width, expected_height, log_queue):
-    # Note: Cancellation check is not added here as it's very low-level file parsing.
-    # Checks are added in the higher-level loops of generate_heightmap.
     height_offsets = []
     base_h = 0
     header_bytes = None
@@ -125,11 +122,11 @@ def process_sector_base_offset(sector_content_bytes, sector_filename_in_zip, exp
             entry_offset_in_data = i * ENTRY_SIZE
             entry_bytes = data_block_bytes[entry_offset_in_data : entry_offset_in_data + ENTRY_SIZE]
             if len(entry_bytes) < ENTRY_SIZE:
-                   log_queue.put(f" E:{filename_short} Unexpected short read at vertex {i+1}/{expected_vertices} (internal error).")
-                   return None, None, None, None, None, None
+                    log_queue.put(f" E:{filename_short} Unexpected short read at vertex {i+1}/{expected_vertices} (internal error).")
+                    return None, None, None, None, None, None
             try:
                 if not all(entry_bytes[z] == 0x00 for z in EXPECTED_ZERO_BYTES_OFFSETS):
-                      log_queue.put(f" W:{filename_short} Entry {i} failed zero byte check {entry_bytes[2:6].hex()}. Using offset anyway.")
+                        log_queue.put(f" W:{filename_short} Entry {i} failed zero byte check {entry_bytes[2:6].hex()}. Using offset anyway.")
                 h_val, = struct.unpack_from(HEIGHT_FORMAT, entry_bytes, HEIGHT_OFFSET_IN_ENTRY)
                 height_offsets.append(h_val)
             except struct.error as e:
@@ -146,9 +143,7 @@ def process_sector_base_offset(sector_content_bytes, sector_filename_in_zip, exp
         log_queue.put(traceback.format_exc())
         return None, None, None, None, None, None
 
-
 def correct_detile_sector(sector_offset_values, sector_width, sector_height, log_queue):
-    # Note: Cancellation check is not added here as it's very low-level.
     detiled_heights = np.zeros((sector_height, sector_width), dtype=np.uint16)
     tiles_per_row = sector_width // TILE_WIDTH
     tiles_per_col = sector_height // TILE_HEIGHT
@@ -182,16 +177,15 @@ def correct_detile_sector(sector_offset_values, sector_width, sector_height, log
     return detiled_heights
 
 def smooth_tile_boundaries(heightmap, tile_width, tile_height, log_queue):
-    # Note: Cancellation check is not added here as it's generally fast.
     if tile_width <= 1 or tile_height <= 1: return heightmap.astype(np.float32)
     height, width = heightmap.shape
     smoothed = heightmap.copy().astype(np.float32)
     for x in range(tile_width - 1, width - 1, tile_width):
         if x > 0 and x < width - 1:
-             smoothed[:, x] = (smoothed[:, x - 1] + smoothed[:, x + 1]) / 2.0
+              smoothed[:, x] = (smoothed[:, x - 1] + smoothed[:, x + 1]) / 2.0
     for y in range(tile_height - 1, height - 1, tile_height):
         if y > 0 and y < height - 1:
-             smoothed[y, :] = (smoothed[y - 1, :] + smoothed[y + 1, :]) / 2.0
+              smoothed[y, :] = (smoothed[y - 1, :] + smoothed[y + 1, :]) / 2.0
     for y in range(tile_height - 1, height - 1, tile_height):
         for x in range(tile_width - 1, width - 1, tile_width):
             if y > 0 and y < height - 1 and x > 0 and x < width - 1:
@@ -199,8 +193,6 @@ def smooth_tile_boundaries(heightmap, tile_width, tile_height, log_queue):
                                   smoothed[y + 1, x - 1] + smoothed[y + 1, x + 1]) / 4.0
     return smoothed
 
-
-# Modified function signature to accept cancel_event
 def generate_heightmap(config, log_queue, progress_queue, cancel_event):
     final_heightmap_float = None
     try:
@@ -234,7 +226,6 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
 
         progress_queue.put(0.0)
 
-        # Check for cancellation before starting expensive operations
         if cancel_event.is_set():
             log_queue.put("--- Processing Cancelled by User (Before Start) ---")
             progress_queue.put(-1.0)
@@ -262,7 +253,6 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
         sectors_data = {}; all_coords = []; processed_count = 0; total_archives = len(all_archives)
 
         for archive_idx, archive_filepath in enumerate(all_archives):
-            # Check for cancellation at the start of each archive processing
             if cancel_event.is_set():
                 log_queue.put("--- Processing Cancelled by User (During Pass 1) ---")
                 progress_queue.put(-1.0)
@@ -278,8 +268,7 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
                     if not sector_members: log_queue.put(f"    No sectors matching '{required_suffix}' found."); continue
 
                     for sector_idx, sector_name_in_zip in enumerate(sector_members):
-                        # Optional: Check more frequently within large archives
-                        if sector_idx % 20 == 0 and cancel_event.is_set(): # Check every 20 sectors
+                        if sector_idx % 20 == 0 and cancel_event.is_set():
                              log_queue.put("--- Processing Cancelled by User (During Pass 1 - Sector Read) ---")
                              progress_queue.put(-1.0)
                              return None
@@ -298,7 +287,6 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
                                     log_queue.put(f"    W: Skip '{filename_short}', dim mismatch ({w}x{h})."); continue
                                 detiled_offsets_uint16 = correct_detile_sector(height_offsets, w, h, log_queue)
                                 if detiled_offsets_uint16 is not None:
-                                    # No cancel check needed here, very fast operation
                                     log_queue.put(f"    OK: Processed {filename_short} ({sx},{sy}) BaseH={base_h}")
                                     sectors_data[(sx, sy)] = {'detiled_offsets': detiled_offsets_uint16, 'base_h': base_h, 'width': w, 'height': h}
                                     all_coords.append((sx, sy)); processed_count += 1; processed_in_archive += 1
@@ -315,7 +303,6 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
             log_queue.put(f"Error: No valid sector data found matching suffix '{required_suffix}'.");
             progress_queue.put(-1.0); return None
 
-        # Check for cancellation before allocating large memory
         if cancel_event.is_set():
              log_queue.put("--- Processing Cancelled by User (Before Pass 2) ---")
              progress_queue.put(-1.0)
@@ -368,11 +355,9 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
         if static_weight_map is None: log_queue.put("E: Failed to create weight map."); progress_queue.put(-1.0); return None
 
         for i, ((sx, sy), data) in enumerate(sectors_data.items()):
-             # Check for cancellation periodically during Pass 2
-            if i % 10 == 0 and cancel_event.is_set(): # Check every 10 sectors blended
+            if i % 10 == 0 and cancel_event.is_set():
                 log_queue.put("--- Processing Cancelled by User (During Pass 2) ---")
                 progress_queue.put(-1.0)
-                # Clean up potentially large arrays before returning
                 del heightmap_sum_array, weight_sum_array, static_weight_map
                 return None
 
@@ -422,11 +407,9 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
         log_queue.put(f"Pass 2 Done. Blended {placed_count} sectors.")
         if placed_count == 0: log_queue.put("E: No sectors placed."); progress_queue.put(-1.0); return None
 
-        # Check for cancellation before final processing/saving
         if cancel_event.is_set():
              log_queue.put("--- Processing Cancelled by User (Before Pass 3) ---")
              progress_queue.put(-1.0)
-             # Clean up potentially large arrays before returning
              del heightmap_sum_array, weight_sum_array, static_weight_map
              return None
 
@@ -435,12 +418,12 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
              log_queue.put("W: No valid overall height range found across sectors. Calculating from sum...")
              valid_mask_tmp = weight_sum_array > 1e-9
              if np.any(valid_mask_tmp):
-                  safe_divisor = np.where(valid_mask_tmp, weight_sum_array, 1.0)
-                  safe_numerator = np.where(valid_mask_tmp, heightmap_sum_array, 0.0)
-                  calculated_heights = safe_numerator[valid_mask_tmp] / safe_divisor[valid_mask_tmp]
-                  temp_min = np.nanmin(calculated_heights); temp_max = np.nanmax(calculated_heights)
-                  if np.isfinite(temp_min) and np.isfinite(temp_max): overall_min_h=temp_min; overall_max_h=temp_max; log_queue.put(f" W: Using sum range: [{overall_min_h:.2f}, {overall_max_h:.2f}]")
-                  else: overall_min_h=0.0; overall_max_h=1.0; log_queue.put(" W: Could not determine range...")
+                 safe_divisor = np.where(valid_mask_tmp, weight_sum_array, 1.0)
+                 safe_numerator = np.where(valid_mask_tmp, heightmap_sum_array, 0.0)
+                 calculated_heights = safe_numerator[valid_mask_tmp] / safe_divisor[valid_mask_tmp]
+                 temp_min = np.nanmin(calculated_heights); temp_max = np.nanmax(calculated_heights)
+                 if np.isfinite(temp_min) and np.isfinite(temp_max): overall_min_h=temp_min; overall_max_h=temp_max; log_queue.put(f" W: Using sum range: [{overall_min_h:.2f}, {overall_max_h:.2f}]")
+                 else: overall_min_h=0.0; overall_max_h=1.0; log_queue.put(" W: Could not determine range...")
              else: overall_min_h=0.0; overall_max_h=1.0; log_queue.put(" W: No valid weights...")
         else: log_queue.put(f"Overall Height Range: [{overall_min_h:.2f}, {overall_max_h:.2f}]")
 
@@ -469,11 +452,10 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
         progress_queue.put(0.95)
 
         try:
-             # Check for cancellation one last time before saving
             if cancel_event.is_set():
                  log_queue.put("--- Processing Cancelled by User (Before Save) ---")
                  progress_queue.put(-1.0)
-                 del final_heightmap_float, heightmap_8bit # Clean up
+                 del final_heightmap_float, heightmap_8bit
                  return None
 
             log_queue.put(f"Saving normalized heightmap PNG to {os.path.basename(output_file_path_png)}...")
@@ -488,9 +470,8 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
 
         except Exception as e:
             log_queue.put(f"\nE: Saving final image: {e}"); traceback.print_exc(); progress_queue.put(-1.0)
-            # Check if cancel was requested during save attempt (less likely but possible)
             if cancel_event.is_set():
-                log_queue.put("--- NOTE: Cancellation was also requested around save time ---")
+                 log_queue.put("--- NOTE: Cancellation was also requested around save time ---")
             return None
 
         return final_heightmap_float
@@ -499,7 +480,6 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
         log_queue.put(f"\n--- UNEXPECTED ERROR in generate_heightmap ---")
         log_queue.put(f"Error: {e}")
         log_queue.put(traceback.format_exc())
-        # Check if cancel was requested during the error
         if cancel_event and cancel_event.is_set():
              log_queue.put("--- NOTE: Cancellation was also requested around error time ---")
         progress_queue.put(-1.0)
