@@ -1,3 +1,7 @@
+# --- gui manager ---
+# Written for use with the Sacred 2 tools.
+# Manages the UI using pyimgui
+
 import os
 import sys
 import time
