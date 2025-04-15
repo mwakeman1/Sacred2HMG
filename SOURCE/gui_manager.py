@@ -1,3 +1,7 @@
+# --- gui manager ---
+# Written for use with the Sacred 2 tools.
+# Manages the UI using pyimgui
+
 import os
 import sys
 import time
@@ -7,7 +11,6 @@ from queue import Queue
 import tkinter as tk
 from tkinter import filedialog
 
-# Attempt to import the required backend
 IMGUI_BACKEND = None
 try:
     import imgui_bundle
@@ -19,8 +22,6 @@ except ImportError as e_bundle:
         IMGUI_BACKEND = "pyimgui"
     except ImportError as e_pyimgui: IMGUI_BACKEND = None
 
-
-# Import the generation function
 generate_heightmap = None
 try:
     from heightmap_generator import generate_heightmap
@@ -29,8 +30,6 @@ except ImportError as e_import: generate_heightmap = None
 except Exception as e_other_import:
     generate_heightmap = None
 
-
-# --- Global GUI State ---
 gui_state = {
     "input_dir": r"C:\Program Files (x86)\Steam\steamapps\common\Sacred 2 Gold\pak",
     "output_filename": "heightmap_output.png",
@@ -47,10 +46,9 @@ gui_state = {
     "progress_queue": Queue(),
     "heightmap_data": None,
     "log_visible": False,
-    "cancel_event": None # Added: Event to signal cancellation
+    "cancel_event": None
 }
 
-# --- GUI Helper Functions ---
 def select_folder_dialog():
     folder_path = None
     try:
@@ -73,24 +71,19 @@ def update_log_and_progress():
 
     while not gui_state["progress_queue"].empty():
         progress = gui_state["progress_queue"].get_nowait()
-        if progress < 0: # Error or Cancel signal from worker
-            # If cancellation was requested, the worker might send -1. Ensure processing flag is reset.
+        if progress < 0:
             gui_state["progress"] = 0.0; gui_state["is_processing"] = False
             if gui_state["processing_thread"] and not gui_state["processing_thread"].is_alive(): gui_state["processing_thread"] = None
-            # Clear the event if processing stopped for any reason (error or cancel)
-            if gui_state["cancel_event"]: gui_state["cancel_event"].set() # Ensure it's set if worker errored
+            if gui_state["cancel_event"]: gui_state["cancel_event"].set()
         else:
             gui_state["progress"] = progress
-            if gui_state["progress"] >= 1.0: # Completion signal
+            if gui_state["progress"] >= 1.0:
                 if gui_state["is_processing"]:
                     gui_state["is_processing"] = False
                 if gui_state["processing_thread"] and not gui_state["processing_thread"].is_alive():
                     gui_state["processing_thread"] = None
-                # Clear the event on successful completion
-                if gui_state["cancel_event"]: gui_state["cancel_event"].set() # Set event just in case, though not strictly necessary
+                if gui_state["cancel_event"]: gui_state["cancel_event"].set()
 
-
-# --- ImGui Interface Functions ---
 def run_gui_imgui_bundle():
     if not generate_heightmap:
         sys.exit("Error: Core generation logic failed to load.")
@@ -106,17 +99,15 @@ def run_gui_imgui_bundle():
         global gui_state
         if gui_state["is_processing"]:
             update_log_and_progress()
-            # Check if thread died unexpectedly (worker should signal via queue, but good failsafe)
             if gui_state["processing_thread"] and not gui_state["processing_thread"].is_alive():
                 update_log_and_progress()
                 if gui_state["progress"] < 1.0 and not (gui_state["cancel_event"] and gui_state["cancel_event"].is_set()):
-                     # Only log warning if not cancelled
-                    gui_state["log_messages"].append("Warning: Processing thread ended unexpectedly.")
-                # Reset state
-                gui_state["is_processing"] = False; gui_state["processing_thread"] = None; gui_state["progress"] = 0.0
-                # Ensure cancel event is set if thread dies
-                if gui_state["cancel_event"]: gui_state["cancel_event"].set()
 
+                    gui_state["log_messages"].append("Warning: Processing thread ended unexpectedly.")
+
+                gui_state["is_processing"] = False; gui_state["processing_thread"] = None; gui_state["progress"] = 0.0
+
+                if gui_state["cancel_event"]: gui_state["cancel_event"].set()
 
         try:
             settings_window_visible = imgui.begin("Heightmap Generation Settings##HGWindow")
@@ -145,10 +136,8 @@ def run_gui_imgui_bundle():
                 if gui_state["height_scale_factor"] <= 1e-6: gui_state["height_scale_factor"] = 1e-6
                 imgui.pop_item_width(); imgui.separator()
 
-                # --- Generate / Cancel Buttons ---
                 use_begin_disabled = hasattr(imgui, "begin_disabled")
 
-                # Generate Button (Disabled during processing)
                 if use_begin_disabled: imgui.begin_disabled(gui_state["is_processing"])
                 elif gui_state["is_processing"]: imgui.push_style_var(getattr(imgui, "StyleVar_Alpha", 15), imgui.get_style().alpha * 0.5)
 
@@ -157,7 +146,6 @@ def run_gui_imgui_bundle():
                 if use_begin_disabled: imgui.end_disabled()
                 elif gui_state["is_processing"]: imgui.pop_style_var()
 
-                # Cancel Button (Enabled ONLY during processing)
                 imgui.same_line(spacing=10)
                 if use_begin_disabled: imgui.begin_disabled(not gui_state["is_processing"])
                 elif not gui_state["is_processing"]: imgui.push_style_var(getattr(imgui, "StyleVar_Alpha", 15), imgui.get_style().alpha * 0.5)
@@ -167,46 +155,40 @@ def run_gui_imgui_bundle():
                 if use_begin_disabled: imgui.end_disabled()
                 elif not gui_state["is_processing"]: imgui.pop_style_var()
 
-                # --- Button Logic ---
                 if generate_clicked:
                     if not gui_state["is_processing"] and generate_heightmap:
                         gui_state["is_processing"] = True; gui_state["progress"] = 0.0; gui_state["log_messages"] = ["--- Starting New Generation ---"]; gui_state["heightmap_data"] = None
                         while not gui_state["log_queue"].empty(): gui_state["log_queue"].get();
                         while not gui_state["progress_queue"].empty(): gui_state["progress_queue"].get()
 
-                        # Create and clear the cancel event for this run
                         gui_state["cancel_event"] = threading.Event()
                         gui_state["cancel_event"].clear()
 
                         current_config = { k: gui_state[k] for k in ['input_dir','output_filename','apply_boundary_smoothing','sector_overlap','boundary_blend_size','height_scale_factor','sector_suffix_type']}
                         try:
-                            # Pass the cancel_event to the worker thread
+
                             gui_state["processing_thread"] = threading.Thread(
                                 target=generate_heightmap,
-                                args=(current_config, gui_state["log_queue"], gui_state["progress_queue"], gui_state["cancel_event"]), # Pass event
+                                args=(current_config, gui_state["log_queue"], gui_state["progress_queue"], gui_state["cancel_event"]),
                                 daemon=True
                             )
                             gui_state["processing_thread"].start();
                         except Exception as e_thread:
                             gui_state["log_messages"].append(f"Error: Failed to start processing thread - {e_thread}")
                             gui_state["is_processing"] = False; gui_state["progress"] = 0.0
-                            gui_state["cancel_event"] = None # Clear event on error
+                            gui_state["cancel_event"] = None
                     elif not generate_heightmap:
                         gui_state["log_messages"].append("ERROR: Processing function failed to load. Cannot start generation.")
 
                 if cancel_clicked:
                     if gui_state["is_processing"] and gui_state["cancel_event"]:
                         gui_state["log_messages"].append("--- Cancel Requested by User ---")
-                        gui_state["cancel_event"].set() # Signal the worker thread to stop
-                        # Note: The worker thread needs to check this event and stop itself.
-                        # The is_processing flag will be reset by update_log_and_progress when the worker signals back.
+                        gui_state["cancel_event"].set()
+                        
+                imgui.same_line(spacing=10); imgui.progress_bar(gui_state["progress"], size_arg=ImVec2(-1, 0))
 
-                # Progress Bar (always visible after buttons)
-                imgui.same_line(spacing=10); imgui.progress_bar(gui_state["progress"], size_arg=ImVec2(-1, 0)) # Make progress bar fill remaining space
+            imgui.end()
 
-            imgui.end() # End Settings Window
-
-            # --- Log Output Panel ---
             viewport = imgui.get_main_viewport()
             vp_pos = viewport.pos; vp_size = viewport.size
 
@@ -256,7 +238,7 @@ def run_gui_imgui_bundle():
 
     runner_params = hello_imgui.RunnerParams()
     runner_params.app_window_params.window_title = "Sacred 2 Sector Heightmap Tool"
-    runner_params.app_window_params.window_geometry.size = (2048, 1080) # User default size
+    runner_params.app_window_params.window_geometry.size = (2048, 1080)
 
     if hasattr(hello_imgui, 'WindowState') and hasattr(hello_imgui.WindowState, 'maximized'):
         try:
@@ -269,10 +251,8 @@ def run_gui_imgui_bundle():
     try:
         hello_imgui.run(runner_params);
     except Exception as e_runner:
-        # Ensure event is set if runner crashes during processing
         if gui_state.get("cancel_event"): gui_state["cancel_event"].set()
         sys.exit(f"Fatal Error during GUI startup: {e_runner}")
-
 
 def run_gui_pyimgui():
     gui_state["log_messages"].append("Error: PyImGui backend selected, but its GUI implementation is currently a basic placeholder.")
