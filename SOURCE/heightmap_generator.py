@@ -8,30 +8,35 @@ import math
 from PIL import Image
 import numpy as np
 import traceback
+
 # Queues and threading.Event are imported and handled by gui_manager.py
 
 # --- Constants ---
-SECTOR_MAGIC = b'SEC\0'
-EXPECTED_VERSION = 0x1C # Decimal 28
-EXPECTED_NUM_CHUNKS = 8
-TERRAIN_VERTEX_CHUNK_ID = 2 # Target chunk ID for terrain data
-EXPECTED_CHUNK_2_SIZE = 8200 # 8 byte header + 1024 * 8 byte vertices
-VERTEX_STRUCT_FORMAT = '<HBBBxxx' # Little-endian: WORD height, 3x BYTE normals, 3 pad bytes
-VERTEX_STRUCT_SIZE = struct.calcsize(VERTEX_STRUCT_FORMAT) # Should be 8
-HEADER_STRUCT_FORMAT = '<4sII' # Magic (4s), Version (I), NumChunks (I)
-HEADER_SIZE = struct.calcsize(HEADER_STRUCT_FORMAT) # Should be 12
-CHUNK_DESC_FORMAT = '<IIII' # ID (I), Flags? (I), Offset (I), Size (I)
-CHUNK_DESC_SIZE = struct.calcsize(CHUNK_DESC_FORMAT)
-CHUNK_TABLE_SIZE = EXPECTED_NUM_CHUNKS * CHUNK_DESC_SIZE # Should be 128
-CHUNK_2_HEADER_FORMAT = '<ff' # Presumed: float scale, float offset
-CHUNK_2_HEADER_SIZE = struct.calcsize(CHUNK_2_HEADER_FORMAT) # Should be 8
-NUM_VERTICES = 1024
-GRID_SIZE = 32 # 32x32 vertices
+SECTOR_MAGIC = b'SEC\0' # Not used in current logic, but kept for context
+EXPECTED_VERSION = 0x1C # Not used in current logic, but kept for context
 
-def extract_heightmap_from_sector(sector_data, sector_filename, log_queue):
+# Constants relevant to the data structure and interpretation (from original script)
+VERTEX_STRUCT_FORMAT = '<HBBBxxx' # Little-endian: WORD height_int, 3x BYTE normals, 3 pad bytes
+VERTEX_STRUCT_SIZE = struct.calcsize(VERTEX_STRUCT_FORMAT) # Should be 8
+NUM_VERTICES = 1024 # 32 * 32 grid
+GRID_SIZE = 32
+CHUNK2_HEADER_FORMAT = '<ff' # Little-endian: float scale, float offset
+CHUNK2_HEADER_SIZE = struct.calcsize(CHUNK2_HEADER_FORMAT) # Should be 8
+
+# --- Constants for the marker search logic (adapted from second script) ---
+START_MARKER = b'\x00\x00\x01\x00'
+VARIABLE_DATA_AFTER_MARKER_SIZE = 4
+INTERMEDIATE_HEADER_SIZE = 8 # This size seems specific to the *second* script's interpretation, but we need it to find the potential *start* of vertex data block based on that script's logic
+BYTES_TO_SKIP_AFTER_MARKER = VARIABLE_DATA_AFTER_MARKER_SIZE + INTERMEDIATE_HEADER_SIZE # Total bytes between end of marker and start of data block in *second* script logic
+N_CONTEXT_CHECK = 5 # How many initial vertex entries to check for validity
+# Indices of expected zero padding bytes within the 8-byte VERTEX_STRUCT_FORMAT
+EXPECTED_ZERO_BYTES_OFFSETS = [5, 6, 7] # Indices within the 8-byte vertex struct that should be padding (likely zero)
+
+# --- HELPER Function for finding data offset ---
+def find_data_block_offset(sector_data, sector_filename, log_queue):
     """
-    Processes the raw binary data of a .sector file based on RE'd structure.
-    Uses log_queue for output.
+    Searches for the start of the vertex data block using marker and context checks.
+    This logic is adapted from the second script.
 
     Args:
         sector_data (bytes): The binary content of the .sector file.
@@ -39,313 +44,488 @@ def extract_heightmap_from_sector(sector_data, sector_filename, log_queue):
         log_queue (queue.Queue): Queue for sending log messages back to GUI.
 
     Returns:
-        tuple: (numpy_array_uint16, scale, offset) or (None, None, None) on error.
-               The numpy array is 32x32 uint16 height data.
-               Scale and offset are floats read from the chunk header.
+        int: The offset to the start of the vertex data array, or -1 if not found.
     """
-    log_prefix = f"  [{os.path.basename(sector_filename)}]" # Use for specific file logs
+    log_prefix = f"  [{os.path.basename(sector_filename)}]"
+    file_size = len(sector_data)
+    if not sector_data:
+        log_queue.put(f"{log_prefix} W: Skipping empty sector content.")
+        return -1
+
+    search_start_offset = 0
+    found_valid_data_offset = -1
+
+    while search_start_offset < file_size:
+        current_marker_offset = sector_data.find(START_MARKER, search_start_offset)
+        if current_marker_offset == -1:
+            # log_queue.put(f"{log_prefix} DBG: Marker {START_MARKER.hex()} not found after offset {search_start_offset}.")
+            break # Marker not found in the rest of the file
+
+        # Calculate where the data block *should* start according to the marker logic
+        potential_data_start = current_marker_offset + len(START_MARKER) + BYTES_TO_SKIP_AFTER_MARKER
+
+        # Check if there's enough space for the context check entries
+        if potential_data_start + (N_CONTEXT_CHECK * VERTEX_STRUCT_SIZE) <= file_size:
+            context_valid = True
+            # log_queue.put(f"{log_prefix} DBG: Marker found at {current_marker_offset}. Potential data start {potential_data_start}. Checking context...")
+            for i in range(N_CONTEXT_CHECK):
+                entry_offset = potential_data_start + (i * VERTEX_STRUCT_SIZE)
+                if entry_offset + VERTEX_STRUCT_SIZE > file_size:
+                    # log_queue.put(f"{log_prefix} DBG: Context check failed: Not enough data for entry {i} at {entry_offset}.")
+                    context_valid = False
+                    break # Not enough data left for this entry
+
+                entry_bytes = sector_data[entry_offset : entry_offset + VERTEX_STRUCT_SIZE]
+
+                # Check if padding bytes are zero (basic heuristic)
+                if not all(entry_bytes[z] == 0x00 for z in EXPECTED_ZERO_BYTES_OFFSETS):
+                    # log_queue.put(f"{log_prefix} DBG: Context check failed: Entry {i} at {entry_offset} failed zero byte check (Bytes: {entry_bytes.hex()}).")
+                    context_valid = False
+                    break # Found an entry where padding bytes aren't zero
+
+            if context_valid:
+                # log_queue.put(f"{log_prefix} DBG: Context check PASSED for {N_CONTEXT_CHECK} entries starting at {potential_data_start}.")
+                # Check if this potential start allows enough space for the *full* vertex data AND the preceding header
+                required_total_size_from_here = CHUNK2_HEADER_SIZE + (NUM_VERTICES * VERTEX_STRUCT_SIZE)
+                potential_header_start = potential_data_start - CHUNK2_HEADER_SIZE
+                if potential_header_start >= 0 and potential_header_start + required_total_size_from_here <= file_size:
+                    log_queue.put(f"{log_prefix} Valid data block found via marker search. Vertex array starts at: {potential_data_start}")
+                    found_valid_data_offset = potential_data_start
+                    break # Found a valid offset, stop searching
+                else:
+                    log_queue.put(f"{log_prefix} W: Marker context valid at {potential_data_start}, but not enough space for header+data (Need {required_total_size_from_here} from {potential_header_start}, File size {file_size}). Continuing search...")
+                    # This context was okay, but placement is bad, continue search
+            #else: # Context check failed for this marker instance, continue search
+                # log_queue.put(f"{log_prefix} DBG: Context check failed for marker at {current_marker_offset}. Continuing search...")
+
+        # Move search start past the current marker to find the next one
+        search_start_offset = current_marker_offset + 1
+
+    if found_valid_data_offset == -1:
+        log_queue.put(f"{log_prefix} Error: Could not find a valid data block offset using marker search.")
+
+    return found_valid_data_offset
+
+
+# --- MODIFIED Function ---
+def extract_heightmap_from_sector(sector_data, sector_filename, log_queue):
+    """
+    Processes the raw binary data of a .sector file by dynamically finding the
+    data block offset using marker search, then reads the scale/offset header
+    preceding it and extracts 32x32 vertex height data.
+
+    Args:
+        sector_data (bytes): The binary content of the .sector file.
+        sector_filename (str): Original filename for logging and lookup.
+        log_queue (queue.Queue): Queue for sending log messages back to GUI.
+
+    Returns:
+        tuple: (numpy_array_float32, scale, offset) or (None, None, None) on error.
+               The numpy array is 32x32 float32 height data (original scale).
+    """
+    log_prefix = f"  [{os.path.basename(sector_filename)}]"
+
+    # --- Find the offset dynamically ---
+    vertex_data_array_offset = find_data_block_offset(sector_data, sector_filename, log_queue)
+
+    if vertex_data_array_offset == -1:
+        # Error already logged by find_data_block_offset
+        return None, None, None
+    # --- End dynamic offset finding ---
+
+    # Calculate the presumed header offset based on the found vertex data offset
+    chunk2_header_offset = vertex_data_array_offset - CHUNK2_HEADER_SIZE
+
+    # --- Basic sanity checks (remain the same) ---
+    if chunk2_header_offset < 0:
+        log_queue.put(f"{log_prefix} Error: Calculated header offset ({chunk2_header_offset}) is invalid for dynamically found vertex offset {vertex_data_array_offset}.")
+        return None, None, None
+
+    required_total_size = CHUNK2_HEADER_SIZE + (NUM_VERTICES * VERTEX_STRUCT_SIZE)
+    if chunk2_header_offset + required_total_size > len(sector_data):
+          log_queue.put(f"{log_prefix} Error: Header offset {chunk2_header_offset} + required size {required_total_size} exceeds file data length ({len(sector_data)}) for dynamic offset {vertex_data_array_offset}.")
+          return None, None, None
+    # --- End Sanity Checks ---
+
+    log_queue.put(f"{log_prefix} Reading scale/offset header from calculated offset: {chunk2_header_offset}.")
+
     try:
-        if len(sector_data) < HEADER_SIZE + CHUNK_TABLE_SIZE:
-            log_queue.put(f"{log_prefix} Error: File data too small ({len(sector_data)} bytes) for header/table.")
-            return None, None, None
+        # --- Read Scale/Offset Header (same as before) ---
+        scale, offset = struct.unpack_from(CHUNK2_HEADER_FORMAT, sector_data, chunk2_header_offset)
+        log_queue.put(f"{log_prefix} Read Scale={scale:.6f}, Offset={offset:.6f}")
 
-        # 1. Read Header
-        magic, version, num_chunks = struct.unpack_from(HEADER_STRUCT_FORMAT, sector_data, 0)
+        # Handle potential zero scale (same as before)
+        if abs(scale) < 1e-9: # Use a small threshold for float comparison
+              log_queue.put(f"{log_prefix} Warning: Scale is near zero ({scale}). Heights will likely be uniform {offset}.")
+              # Avoid division by zero later if we were using inv_scale, but fine for current formula
+              # scale = 1e-9 # Prevent actual zero if needed elsewhere
 
-        if magic != SECTOR_MAGIC:
-            log_queue.put(f"{log_prefix} Error: Invalid magic ID: {magic}")
-            return None, None, None
-        if version != EXPECTED_VERSION:
-            log_queue.put(f"{log_prefix} Warning: Unexpected version {version} (expected {EXPECTED_VERSION})")
-            # Continue processing if version differs, might still work
-        if num_chunks != EXPECTED_NUM_CHUNKS:
-            log_queue.put(f"{log_prefix} Warning: Expected {EXPECTED_NUM_CHUNKS} chunks, found {num_chunks}")
-            # Continue but only read up to expected number of descriptors
+        height_values_float = []
+        # --- Read Vertex Data (using the dynamically found offset) ---
+        for i in range(NUM_VERTICES): # 1024 times for 32x32 grid
+            current_vertex_offset = vertex_data_array_offset + (i * VERTEX_STRUCT_SIZE)
+            # Unpack just the height_int (first 2 bytes, '<H')
+            height_int, = struct.unpack_from('<H', sector_data, current_vertex_offset) # Only need the height part
 
-        # 2. Read Chunk Table
-        chunk_descriptors = []
-        table_offset = HEADER_SIZE
-        # Read up to num_chunks reported, but cap at EXPECTED_NUM_CHUNKS for safety
-        effective_num_chunks_to_read = min(num_chunks, EXPECTED_NUM_CHUNKS)
-        # Optional Debug log: log_queue.put(f"{log_prefix} --- Chunk Table (Reading {effective_num_chunks_to_read}/{num_chunks} Chunks) ---")
+            # --- Apply the loading formula (same as before) ---
+            y_float = (float(height_int) * scale) + offset
+            height_values_float.append(y_float)
 
-        for i in range(effective_num_chunks_to_read):
-            desc_offset = table_offset + (i * CHUNK_DESC_SIZE)
-            if desc_offset + CHUNK_DESC_SIZE > len(sector_data):
-                log_queue.put(f"{log_prefix} Error: File data too small for chunk descriptor {i}")
-                # Don't return yet, maybe the target chunk was already found
-                break # Stop reading descriptors
-            try:
-                chunk_id, flags, chunk_offset, chunk_size = struct.unpack_from(
-                    CHUNK_DESC_FORMAT, sector_data, desc_offset
-                )
-                # Optional Debug Log:
-                # log_queue.put(f"{log_prefix}    Chunk[{i}]: ID={chunk_id:<3} Offset={chunk_offset:<8} Size={chunk_size:<8} Flags={flags:#010x}")
-                chunk_descriptors.append({'id': chunk_id, 'offset': chunk_offset, 'size': chunk_size, 'flags': flags})
-            except struct.error as e:
-                 log_queue.put(f"{log_prefix} Error unpacking chunk descriptor {i}: {e}")
-                 # Don't return yet
+        # Create NumPy array with float32 dtype and reshape (same as before)
+        height_map_array = np.array(height_values_float, dtype=np.float32).reshape((GRID_SIZE, GRID_SIZE)) # 32x32
 
-        # Optional Debug log: log_queue.put(f"{log_prefix} --- End Chunk Table ---")
-
-        # 3. Find Terrain Vertex Chunk (ID 2)
-        terrain_chunk_desc = None
-        for desc in chunk_descriptors:
-            # Check ID and also ensure Offset and Size seem plausible
-            # Offset must be after header and chunk table
-            # Size must accommodate at least the chunk header
-            if desc['id'] == TERRAIN_VERTEX_CHUNK_ID and \
-               desc['offset'] >= HEADER_SIZE + CHUNK_TABLE_SIZE and \
-               desc['size'] >= CHUNK_2_HEADER_SIZE:
-                terrain_chunk_desc = desc
-                break
-
-        if terrain_chunk_desc is None:
-            log_queue.put(f"{log_prefix} Error: Terrain Vertex Chunk (ID {TERRAIN_VERTEX_CHUNK_ID}) not found or invalid in table.")
-            return None, None, None
-
-        chunk_offset = terrain_chunk_desc['offset']
-        chunk_size = terrain_chunk_desc['size']
-
-        if chunk_size != EXPECTED_CHUNK_2_SIZE:
-            log_queue.put(f"{log_prefix} Warning: Terrain Chunk size is {chunk_size}, expected {EXPECTED_CHUNK_2_SIZE}.")
-            # Continue if size differs, but might lead to read errors later
-
-        if chunk_offset + chunk_size > len(sector_data):
-             log_queue.put(f"{log_prefix} Error: Chunk offset/size ({chunk_offset}/{chunk_size}) exceeds file data length ({len(sector_data)}).")
-             return None, None, None
-
-        # 4. Read Chunk 2 Header (Scale/Offset)
-        try:
-            scale, offset = struct.unpack_from(
-                CHUNK_2_HEADER_FORMAT, sector_data, chunk_offset
-            )
-            if not (math.isfinite(scale) and math.isfinite(offset)):
-                 log_queue.put(f"{log_prefix} Warning: Scale/Offset values are non-finite ({scale}, {offset}). Check CHUNK_2_HEADER_FORMAT?")
-                 # Continue, but scale/offset values are likely meaningless
-            # log_queue.put(f"{log_prefix} Read Scale: {scale}, Offset: {offset}") # Optional Debug
-        except struct.error as e:
-            log_queue.put(f"{log_prefix} Error unpacking scale/offset header: {e}")
-            return None, None, None # Can't proceed without reading header correctly
-
-        # 5. Read Vertex Data Array
-        vertex_data_offset = chunk_offset + CHUNK_2_HEADER_SIZE
-        # Calculate available size for vertices based on reported chunk size
-        vertex_data_size = chunk_size - CHUNK_2_HEADER_SIZE
-        # Calculate max possible vertices based on available data and struct size
-        max_vertices_possible = vertex_data_size // VERTEX_STRUCT_SIZE if VERTEX_STRUCT_SIZE > 0 else 0
-
-        # Determine how many vertices to actually read: minimum of expected, possible, and prevent reading past chunk end
-        num_vertices_to_read = min(NUM_VERTICES, max_vertices_possible)
-
-        if num_vertices_to_read < NUM_VERTICES:
-             log_queue.put(f"{log_prefix} Warning: Available vertex data size ({vertex_data_size} bytes) allows for only {num_vertices_to_read} vertices (expected {NUM_VERTICES}).")
-             if num_vertices_to_read <= 0:
-                 log_queue.put(f"{log_prefix} Error: No vertex data available after header.")
-                 return None, None, None # Cannot proceed
-        elif chunk_size > EXPECTED_CHUNK_2_SIZE and max_vertices_possible > NUM_VERTICES:
-             log_queue.put(f"{log_prefix} Warning: Chunk data size ({chunk_size}) is larger than expected. Reading only the first {NUM_VERTICES} vertices.")
-             num_vertices_to_read = NUM_VERTICES # Clamp reading to expected amount
-
-        height_values = []
-        for i in range(num_vertices_to_read):
-            current_offset = vertex_data_offset + (i * VERTEX_STRUCT_SIZE)
-            # Ensure we don't read past the *calculated* vertex data end
-            if current_offset + VERTEX_STRUCT_SIZE > vertex_data_offset + vertex_data_size:
-                log_queue.put(f"{log_prefix} Error: Reading vertex {i} would exceed calculated chunk data boundary ({vertex_data_offset + vertex_data_size}). Stopping read.")
-                break
-
-            try:
-                # Unpack just the height (first 2 bytes, '<H')
-                height_int, = struct.unpack_from('<H', sector_data, current_offset)
-                height_values.append(height_int)
-            except struct.error as e:
-                log_queue.put(f"{log_prefix} Error unpacking height for vertex {i}: {e}")
-                height_values.append(0) # Pad with default on error for this vertex
-
-        # If we read fewer vertices than expected (due to errors or small chunk) pad the rest
-        if len(height_values) < NUM_VERTICES:
-             log_queue.put(f"{log_prefix} Warning: Read {len(height_values)} vertices, expected {NUM_VERTICES}. Padding with zeros.")
-             height_values.extend([0] * (NUM_VERTICES - len(height_values)))
-
-        # 6. Create NumPy array and reshape
-        height_map_array = np.array(height_values, dtype=np.uint16).reshape((GRID_SIZE, GRID_SIZE))
-
+        # Return the float array and the scale/offset read
         return height_map_array, scale, offset
 
     except struct.error as e:
-        log_queue.put(f"{log_prefix} Error unpacking binary data: {e}")
+        log_queue.put(f"{log_prefix} Error unpacking data (Header Offset: {chunk2_header_offset}, Vert Offset: {vertex_data_array_offset}): {e}")
         return None, None, None
     except Exception as e:
-        log_queue.put(f"{log_prefix} An unexpected error occurred: {e}")
-        log_queue.put(traceback.format_exc())
+        log_queue.put(f"{log_prefix} An unexpected error occurred during processing: {e}")
+        # log_queue.put(traceback.format_exc()) # Optional: Add full traceback for debugging
         return None, None, None
 
-# --- Main worker function called by the GUI ---
+
+# --- Main Worker Function ---
 def generate_heightmap(config, log_queue, progress_queue, cancel_event):
     """
-    Main worker function. Scans archives based on config, extracts sectors,
-    generates PNGs. Communicates via queues and checks cancel_event.
+    Main worker function. Scans archives, extracts sectors, generates PNGs.
+    Handles float heightmaps and directly converts to uint16 for visualization.
+    Communicates via queues and checks cancel_event.
     """
     try:
         input_dir_path = config.get('input_dir', '.')
-        output_dir_path = config.get('output_dir', '.') # Get output directory from config
-        sector_suffix_type = config.get('sector_suffix_type', 'B0') # Default to B0
+        output_dir_path = config.get('output_dir', '.')
+        sector_suffix_type = config.get('sector_suffix_type', 'B0')
+        # --- Normalization Setting IS NO LONGER USED ---
+        # normalization_mode = config.get('normalization', 'global')
+        # log_queue.put(f"Using normalization mode: {normalization_mode}")
+        # ---
 
-        # Ensure output directory exists
+        # Ensure output directory exists (code unchanged)
         if not os.path.exists(output_dir_path):
-            try:
-                os.makedirs(output_dir_path, exist_ok=True) # exist_ok=True prevents error if dir already exists
-                log_queue.put(f"Created output directory: {output_dir_path}")
-            except OSError as e:
-                log_queue.put(f"Error: Cannot create output directory '{output_dir_path}': {e}")
-                progress_queue.put(-1.0) # Signal error
-                return
+             try:
+                 os.makedirs(output_dir_path, exist_ok=True)
+                 log_queue.put(f"Created output directory: {output_dir_path}")
+             except OSError as e:
+                 log_queue.put(f"Error: Cannot create output directory '{output_dir_path}': {e}")
+                 progress_queue.put(-1.0)
+                 return
         elif not os.path.isdir(output_dir_path):
-             log_queue.put(f"Error: Output path '{output_dir_path}' exists but is not a directory.")
-             progress_queue.put(-1.0) # Signal error
-             return
+              log_queue.put(f"Error: Output path '{output_dir_path}' exists but is not a directory.")
+              progress_queue.put(-1.0)
+              return
 
-
-        # Determine the required suffix based on config
+        # Determine required suffix (code unchanged)
         if sector_suffix_type == "B0": required_suffix = "_b0.sector"
         elif sector_suffix_type == "D1": required_suffix = "_d1.sector"
         elif sector_suffix_type == "D2": required_suffix = "_d2.sector"
         else:
-            log_queue.put(f"Warning: Invalid sector_suffix_type '{sector_suffix_type}'. Defaulting to _b0.sector")
-            required_suffix = "_b0.sector"
+             log_queue.put(f"Warning: Invalid sector_suffix_type '{sector_suffix_type}'. Defaulting to _b0.sector")
+             required_suffix = "_b0.sector"
         log_queue.put(f"Searching for sector files ending with: '{required_suffix}' (case-insensitive)")
 
+        # Find archives (code unchanged)
         all_archives = []
         try:
-            log_queue.put(f"Scanning input directory: {input_dir_path}")
-            # Ensure paths are absolute for glob
-            abs_input_dir = os.path.abspath(input_dir_path)
-            all_archives.extend(glob.glob(os.path.join(abs_input_dir, '*.zip')))
-            all_archives.extend(glob.glob(os.path.join(abs_input_dir, '*.pak')))
-            all_archives = sorted(list(set(all_archives))) # Remove duplicates and sort
-            log_queue.put(f"Found {len(all_archives)} ZIP/PAK archives.")
+             log_queue.put(f"Scanning input directory: {input_dir_path}")
+             abs_input_dir = os.path.abspath(input_dir_path)
+             all_archives.extend(glob.glob(os.path.join(abs_input_dir, '*.zip')))
+             all_archives.extend(glob.glob(os.path.join(abs_input_dir, '*.pak')))
+             all_archives = sorted(list(set(all_archives)))
+             log_queue.put(f"Found {len(all_archives)} ZIP/PAK archives.")
         except Exception as e:
-            log_queue.put(f"Error searching for archives in '{input_dir_path}': {e}")
-            progress_queue.put(-1.0)
-            return
+             log_queue.put(f"Error searching for archives in '{input_dir_path}': {e}")
+             progress_queue.put(-1.0)
+             return
 
         if not all_archives:
-            log_queue.put(f"Error: No .zip or .pak archives found in '{input_dir_path}'.")
-            progress_queue.put(-1.0)
-            return
+             log_queue.put(f"Error: No .zip or .pak archives found in '{input_dir_path}'.")
+             progress_queue.put(-1.0)
+             return
 
         total_processed_count = 0
         total_failed_count = 0
         total_archives = len(all_archives)
+        progress_scale = 0.95 # Leave some room for final saving
 
-        # Progress: 0% at start, up to 95% during file processing, last 5% for wrap-up/save
-        progress_scale = 0.95
+        # --- Data storage ---
+        all_height_data = {} # Store {output_png_path: float_array}
+        # --- global min/max no longer needed for normalization ---
+        # global_min_height = float('inf')
+        # global_max_height = float('-inf')
+        # ---
 
+        # --- Pass 1: Extract all float data ---
+        log_queue.put("\n--- Pass 1: Extracting height data ---")
         for archive_idx, archive_filepath in enumerate(all_archives):
-            if cancel_event.is_set():
-                log_queue.put(f"Cancellation requested before processing {os.path.basename(archive_filepath)}.")
-                progress_queue.put(-1.0) # Signal cancellation/error state
-                return
+             if cancel_event.is_set():
+                 log_queue.put(f"Cancellation requested during Pass 1.")
+                 progress_queue.put(-1.0)
+                 return
 
-            archive_filename = os.path.basename(archive_filepath)
-            log_queue.put(f"\nProcessing archive: {archive_filename} ({archive_idx + 1}/{total_archives})")
-            processed_in_archive = 0
-            failed_in_archive = 0
-            sectors_found_in_archive = 0
-            try:
-                with zipfile.ZipFile(archive_filepath, 'r') as zf:
-                    file_list = zf.infolist()
-                    # Filter for files ending with suffix, ignore directories, case-insensitive
-                    matching_files = [fi for fi in file_list if fi.filename.lower().endswith(required_suffix.lower()) and not fi.is_dir()]
-                    sectors_found_in_archive = len(matching_files)
+             archive_filename = os.path.basename(archive_filepath)
+             log_queue.put(f"\nProcessing archive: {archive_filename} ({archive_idx + 1}/{total_archives})")
+             processed_in_archive = 0
+             failed_in_archive = 0
+             try:
+                 with zipfile.ZipFile(archive_filepath, 'r') as zf:
+                     file_list = zf.infolist()
+                     matching_files = [fi for fi in file_list if fi.filename.lower().endswith(required_suffix.lower()) and not fi.is_dir()]
+                     sectors_found_in_archive = len(matching_files)
 
-                    if sectors_found_in_archive == 0:
+                     if sectors_found_in_archive == 0:
                          log_queue.put(f"  No sectors matching '{required_suffix}' found.")
-                         # Update progress based on completing this archive scan
-                         overall_progress = progress_scale * (archive_idx + 1) / total_archives
-                         progress_queue.put(overall_progress)
-                         continue # Move to the next archive
+                         if total_archives > 0:
+                             progress_queue.put(progress_scale * (archive_idx + 1) / total_archives * 0.5) # Halfway through pass 1
+                         continue
 
-                    log_queue.put(f"  Found {sectors_found_in_archive} matching sectors. Processing...")
-                    for file_idx, file_info in enumerate(matching_files):
-                        if cancel_event.is_set():
-                            log_queue.put(f"Cancellation requested while processing {archive_filename}.")
-                            progress_queue.put(-1.0)
-                            return # Exit immediately
+                     log_queue.put(f"  Found {sectors_found_in_archive} matching sectors. Extracting...")
+                     for file_idx, file_info in enumerate(matching_files):
+                         if cancel_event.is_set():
+                             log_queue.put(f"Cancellation requested while processing {archive_filename}.")
+                             progress_queue.put(-1.0)
+                             return
 
-                        try:
-                            sector_data = zf.read(file_info.filename)
-                            height_map_array, scale, offset = extract_heightmap_from_sector(sector_data, file_info.filename, log_queue)
+                         try:
+                             sector_data = zf.read(file_info.filename)
+                             # --- Call the extraction function ---
+                             height_map_array, scale, offset = extract_heightmap_from_sector(
+                                 sector_data, file_info.filename, log_queue
+                             )
+                             # ---
 
-                            if height_map_array is not None:
-                                # Construct output filename using the sector's base name
-                                base_name = os.path.basename(file_info.filename)
-                                # Robustly remove known suffixes
-                                if base_name.lower().endswith('_b0.sector'): base_name = base_name[:-len('_b0.sector')]
-                                elif base_name.lower().endswith('_d1.sector'): base_name = base_name[:-len('_d1.sector')]
-                                elif base_name.lower().endswith('_d2.sector'): base_name = base_name[:-len('_d2.sector')]
-                                elif base_name.lower().endswith('.sector'): base_name = base_name[:-len('.sector')]
+                             if height_map_array is not None:
+                                 # --- Store for Pass 2 ---
+                                 base_name = os.path.basename(file_info.filename)
+                                 # Simplify suffix removal
+                                 if base_name.lower().endswith(required_suffix.lower()):
+                                    base_name = base_name[:-len(required_suffix)]
+                                 elif base_name.lower().endswith(".sector"): # Fallback just in case
+                                    base_name = base_name[:-len(".sector")]
 
-                                output_png_filename = f"{base_name}_height.png"
-                                output_png_path = os.path.join(output_dir_path, output_png_filename)
+                                 output_png_filename = f"{base_name}_height.png"
+                                 output_png_path = os.path.join(output_dir_path, output_png_filename)
 
-                                img = Image.fromarray(height_map_array, mode='I;16') # 'I;16' for 16-bit integer grayscale
-                                img.save(output_png_path)
-                                log_queue.put(f"    -> Saved: {output_png_filename} (Scale={scale:.2f}, Offset={offset:.2f})")
-                                processed_in_archive += 1
-                            else:
-                                # extract_heightmap_from_sector already logged the specific error
-                                failed_in_archive += 1
+                                 all_height_data[output_png_path] = height_map_array
 
-                        except zipfile.BadZipFile as bz:
-                            log_queue.put(f"  -> Error reading file {file_info.filename} from archive (corrupted?): {bz}")
-                            failed_in_archive +=1
-                        except OSError as ose:
-                            log_queue.put(f"  -> OS Error processing/saving file {file_info.filename}: {ose}")
-                            failed_in_archive += 1
-                        except Exception as e:
-                            log_queue.put(f"  -> Unexpected error processing file {file_info.filename}: {e}")
-                            log_queue.put(traceback.format_exc())
-                            failed_in_archive += 1
+                                 # --- No longer updating global min/max here ---
+                                 # if normalization_mode == 'global':
+                                 #     min_h = np.min(height_map_array)
+                                 #     max_h = np.max(height_map_array)
+                                 #     if np.isfinite(min_h) and min_h < global_min_height: global_min_height = min_h
+                                 #     if np.isfinite(max_h) and max_h > global_max_height: global_max_height = max_h
+                                 # ---
+                                 processed_in_archive += 1
+                             else:
+                                 failed_in_archive += 1
 
-                        # Update progress based on files within this archive relative to total archives
-                        # Calculate progress within the current archive
-                        current_archive_progress = (file_idx + 1) / sectors_found_in_archive
-                        # Calculate overall progress considering completed archives and progress within current one
-                        overall_progress = progress_scale * (archive_idx + current_archive_progress) / total_archives
-                        progress_queue.put(overall_progress)
+                         except zipfile.BadZipFile as bz:
+                             log_queue.put(f"  -> Error reading file {file_info.filename} from archive (corrupted?): {bz}")
+                             failed_in_archive +=1
+                         except OSError as ose:
+                             log_queue.put(f"  -> OS Error processing/saving file {file_info.filename}: {ose}")
+                             failed_in_archive += 1
+                         except Exception as e:
+                             log_queue.put(f"  -> Unexpected error processing file {file_info.filename}: {e}")
+                             log_queue.put(traceback.format_exc())
+                             failed_in_archive += 1
 
-            except zipfile.BadZipFile:
-                log_queue.put(f"  Error: Invalid or corrupted archive: {archive_filename}. Skipping.")
-                total_failed_count += 1 # Count the archive itself as a failure
-            except FileNotFoundError:
-                 log_queue.put(f"  Error: Archive file not found during processing loop (was it moved/deleted?): {archive_filename}")
+                         # Update progress within Pass 1
+                         if sectors_found_in_archive > 0:
+                             current_archive_progress = (file_idx + 1) / sectors_found_in_archive
+                             overall_progress = progress_scale * (archive_idx + current_archive_progress) / total_archives * 0.5 # Max 50% in pass 1
+                             progress_queue.put(overall_progress)
+                         elif total_archives > 0: # Update even if no sectors found in this archive
+                             overall_progress = progress_scale * (archive_idx + 1) / total_archives * 0.5
+                             progress_queue.put(overall_progress)
+
+             except zipfile.BadZipFile:
+                 log_queue.put(f"  Error: Invalid or corrupted archive: {archive_filename}. Skipping.")
                  total_failed_count += 1
-            except PermissionError:
-                log_queue.put(f"  Error: Permission denied reading archive: {archive_filename}. Skipping.")
-                total_failed_count += 1
-            except Exception as e:
-                log_queue.put(f"  An unexpected error occurred opening/reading archive {archive_filename}: {e}")
-                log_queue.put(traceback.format_exc())
-                total_failed_count += 1 # Count the archive itself as a failure
-            finally:
-                log_queue.put(f"  Finished archive. Processed: {processed_in_archive}, Failed/Skipped: {failed_in_archive}")
-                total_processed_count += processed_in_archive
-                total_failed_count += failed_in_archive
+             except FileNotFoundError:
+                  log_queue.put(f"  Error: Archive file not found during processing loop (was it moved/deleted?): {archive_filename}")
+                  total_failed_count += 1
+             except PermissionError:
+                  log_queue.put(f"  Error: Permission denied reading archive: {archive_filename}. Skipping.")
+                  total_failed_count += 1
+             except Exception as e:
+                 log_queue.put(f"  An unexpected error occurred opening/reading archive {archive_filename}: {e}")
+                 log_queue.put(traceback.format_exc())
+                 total_failed_count += 1
+             finally:
+                 log_queue.put(f"  Finished archive extraction. Processed: {processed_in_archive}, Failed/Skipped: {failed_in_archive}")
+                 total_processed_count += processed_in_archive
+                 total_failed_count += failed_in_archive # Add file failures to total
+
+        if cancel_event.is_set():
+              log_queue.put("\n--- Processing Cancelled After Pass 1 ---")
+              progress_queue.put(-1.0)
+              return
+
+        if not all_height_data:
+              log_queue.put("\n--- No height data successfully extracted. Finished ---")
+              progress_queue.put(1.0 if total_failed_count == 0 else -1.0) # Success only if no errors at all
+              return
+
+        # --- Pass 2: Convert and Save PNGs (NO NORMALIZATION) ---
+        log_queue.put(f"\n--- Pass 2: Converting and saving {len(all_height_data)} heightmaps (Direct Conversion) ---")
+        log_queue.put("NOTE: Normalization skipped. Float heights converted directly to uint16.")
+
+        num_to_save = len(all_height_data)
+        saved_count = 0
+        save_failed_count = 0
+
+        for idx, (output_png_path, float_array) in enumerate(all_height_data.items()):
+              if cancel_event.is_set():
+                  log_queue.put(f"Cancellation requested during Pass 2.")
+                  progress_queue.put(-1.0)
+                  return
+
+              output_png_filename = os.path.basename(output_png_path)
+              try:
+                  # --- REMOVED NORMALIZATION BLOCK ---
+
+                  # Handle potential NaNs before direct conversion
+                  # Replace NaNs with 0 before casting to uint16
+                  float_array_filled = np.nan_to_num(float_array, nan=0.0)
+
+                  # Directly convert float array to uint16
+                  # WARNING: This may result in data loss or unexpected visuals
+                  # if float values are outside the 0-65535 range or negative.
+                  img_array_uint16 = float_array_filled.astype(np.uint16)
+                  # --- End Conversion ---
+
+                  img = Image.fromarray(img_array_uint16, mode='I;16')
+                  img.save(output_png_path)
+                  log_queue.put(f"  -> Saved: {output_png_filename} (Direct Conversion)")
+                  saved_count += 1
+              except Exception as e:
+                  log_queue.put(f"  -> Error saving {output_png_filename}: {e}")
+                  log_queue.put(traceback.format_exc())
+                  save_failed_count += 1
+
+              # Update progress during Pass 2
+              overall_progress = progress_scale * (0.5 + ( (idx + 1) / num_to_save * 0.5) ) # Progress from 50% to 95%
+              progress_queue.put(overall_progress)
+
+        total_failed_count += save_failed_count
 
         # --- Processing Finished ---
         if cancel_event.is_set():
-            log_queue.put(f"\n--- Processing Cancelled ---")
+             log_queue.put("\n--- Processing Cancelled During Pass 2 ---")
         else:
-            log_queue.put(f"\n--- Finished processing all archives ---")
-            log_queue.put(f"Total Sectors Matching '{required_suffix}' Successfully Processed: {total_processed_count}")
-            log_queue.put(f"Total Failures (Files/Archives): {total_failed_count}")
-            progress_queue.put(1.0) # Signal normal completion
+             log_queue.put("\n--- Finished processing all archives ---")
+             log_queue.put(f"Total Sectors Matching '{required_suffix}' Successfully Processed & Saved: {saved_count}")
+             log_queue.put(f"Total Extraction Failures (Marker Search/Read/File): {total_failed_count - save_failed_count}")
+             log_queue.put(f"Total Save Failures: {save_failed_count}")
+             progress_queue.put(1.0) # Signal normal completion
 
     except Exception as e:
-         log_queue.put(f"\n--- FATAL ERROR in generate_heightmap ---")
+         log_queue.put("\n--- FATAL ERROR in generate_heightmap ---")
          log_queue.put(f"Error: {e}")
          log_queue.put(traceback.format_exc())
          progress_queue.put(-1.0) # Signal error
-    # No finally block needed to send progress, handled by specific return paths
+
+
+# --- Example execution block (if needed for testing) ---
+if __name__ == '__main__':
+    import queue
+    import threading
+
+    # --- Configuration ---
+    config = {
+        'input_dir': r'C:\Program Files (x86)\Steam\steamapps\common\Sacred 2 Gold\pak', # Example Path
+        'output_dir': r'.\heightmap_output_no_norm',  # Example Output Subdirectory
+        'sector_suffix_type': 'B0', # Or D1, D2
+        # 'normalization': 'global' # REMOVED - No longer used
+    }
+
+    # --- Setup Queues and Event ---
+    log_queue = queue.Queue()
+    progress_queue = queue.Queue()
+    cancel_event = threading.Event()
+
+    # --- Log Printing Function ---
+    def log_printer(stop_event):
+        print("Log Printer Started")
+        while not stop_event.is_set():
+            try:
+                message = log_queue.get(timeout=0.2)
+                print(message)
+                log_queue.task_done()
+            except queue.Empty:
+                # If the generator is done and the queue is empty, stop
+                if not generator_thread.is_alive() and log_queue.empty():
+                    break
+            except Exception as e:
+                print(f"Log printer error: {e}")
+                break
+        # Drain any remaining messages quickly after stop signal
+        while not log_queue.empty():
+             try:
+                 print(log_queue.get_nowait())
+                 log_queue.task_done()
+             except queue.Empty:
+                 break
+        print("Log Printer Stopped")
+
+
+    # --- Start Generator ---
+    print("Starting generator thread...")
+    generator_thread = threading.Thread(target=generate_heightmap, args=(config, log_queue, progress_queue, cancel_event))
+    generator_thread.start()
+
+    # --- Start Log Printer ---
+    log_stop_event = threading.Event()
+    printer_thread = threading.Thread(target=log_printer, args=(log_stop_event,))
+    printer_thread.start()
+
+    # --- Monitor Progress ---
+    final_progress = 0.0
+    while generator_thread.is_alive():
+        try:
+            # You could add a cancel condition here, e.g., input("Press Enter to cancel...\n")
+            # if user_input:
+            #    cancel_event.set()
+            #    print("Cancellation requested...")
+
+            progress = progress_queue.get(timeout=0.5)
+            final_progress = progress # Store last known progress
+            if progress == 1.0:
+                print("\nProgress: 100% (Complete signal)")
+            elif progress < 0:
+                 print("\nProgress: Error/Cancelled signal")
+                 if not cancel_event.is_set(): # If error signal but not cancelled by user
+                     cancel_event.set() # Ensure threads know to stop cleanly
+            else:
+                 print(f"Progress: {progress*100:.1f}%", end='\r') # Overwrite line
+        except queue.Empty:
+            pass
+        except Exception as e:
+             print(f"\nProgress queue error: {e}")
+             cancel_event.set() # Signal stop on error
+             break
+    print() # Newline after progress updates
+
+    # --- Wait for Threads ---
+    print("Waiting for generator thread to finish...")
+    generator_thread.join(timeout=10) # Add timeout
+    if generator_thread.is_alive():
+        print("Generator thread timed out.")
+        cancel_event.set() # Force stop if stuck
+
+    print("Signaling log printer to stop...")
+    log_stop_event.set()
+    print("Waiting for log printer thread to finish...")
+    printer_thread.join(timeout=5) # Add timeout
+    if printer_thread.is_alive():
+        print("Log printer thread timed out.")
+
+    print("\n--- Main script finished ---")
+    if final_progress == 1.0:
+        print("Processing completed successfully.")
+    elif cancel_event.is_set() and final_progress >= 0:
+        print("Processing was cancelled.")
+    else:
+        print("Processing finished with errors or was cancelled due to errors.")
