@@ -1,4 +1,3 @@
-# heightmap_generator.py
 import struct
 import zipfile
 import io
@@ -9,43 +8,24 @@ from PIL import Image
 import numpy as np
 import traceback
 
-# Queues and threading.Event are imported and handled by gui_manager.py
+SECTOR_MAGIC = b'SEC\0'
+EXPECTED_VERSION = 0x1C
 
-# --- Constants ---
-SECTOR_MAGIC = b'SEC\0' # Not used in current logic, but kept for context
-EXPECTED_VERSION = 0x1C # Not used in current logic, but kept for context
-
-# Constants relevant to the data structure and interpretation (from original script)
-VERTEX_STRUCT_FORMAT = '<HBBBxxx' # Little-endian: WORD height_int, 3x BYTE normals, 3 pad bytes
-VERTEX_STRUCT_SIZE = struct.calcsize(VERTEX_STRUCT_FORMAT) # Should be 8
-NUM_VERTICES = 1024 # 32 * 32 grid
+VERTEX_STRUCT_FORMAT = '<HBBBxxx'
+VERTEX_STRUCT_SIZE = struct.calcsize(VERTEX_STRUCT_FORMAT)
+NUM_VERTICES = 1024
 GRID_SIZE = 32
-CHUNK2_HEADER_FORMAT = '<ff' # Little-endian: float scale, float offset
-CHUNK2_HEADER_SIZE = struct.calcsize(CHUNK2_HEADER_FORMAT) # Should be 8
+CHUNK2_HEADER_FORMAT = '<ff'
+CHUNK2_HEADER_SIZE = struct.calcsize(CHUNK2_HEADER_FORMAT)
 
-# --- Constants for the marker search logic (adapted from second script) ---
 START_MARKER = b'\x00\x00\x01\x00'
 VARIABLE_DATA_AFTER_MARKER_SIZE = 4
-INTERMEDIATE_HEADER_SIZE = 8 # This size seems specific to the *second* script's interpretation, but we need it to find the potential *start* of vertex data block based on that script's logic
-BYTES_TO_SKIP_AFTER_MARKER = VARIABLE_DATA_AFTER_MARKER_SIZE + INTERMEDIATE_HEADER_SIZE # Total bytes between end of marker and start of data block in *second* script logic
-N_CONTEXT_CHECK = 5 # How many initial vertex entries to check for validity
-# Indices of expected zero padding bytes within the 8-byte VERTEX_STRUCT_FORMAT
-EXPECTED_ZERO_BYTES_OFFSETS = [5, 6, 7] # Indices within the 8-byte vertex struct that should be padding (likely zero)
+INTERMEDIATE_HEADER_SIZE = 8
+BYTES_TO_SKIP_AFTER_MARKER = VARIABLE_DATA_AFTER_MARKER_SIZE + INTERMEDIATE_HEADER_SIZE
+N_CONTEXT_CHECK = 5
+EXPECTED_ZERO_BYTES_OFFSETS = [5, 6, 7]
 
-# --- HELPER Function for finding data offset ---
 def find_data_block_offset(sector_data, sector_filename, log_queue):
-    """
-    Searches for the start of the vertex data block using marker and context checks.
-    This logic is adapted from the second script.
-
-    Args:
-        sector_data (bytes): The binary content of the .sector file.
-        sector_filename (str): Original filename for logging.
-        log_queue (queue.Queue): Queue for sending log messages back to GUI.
-
-    Returns:
-        int: The offset to the start of the vertex data array, or -1 if not found.
-    """
     log_prefix = f"  [{os.path.basename(sector_filename)}]"
     file_size = len(sector_data)
     if not sector_data:
@@ -58,47 +38,34 @@ def find_data_block_offset(sector_data, sector_filename, log_queue):
     while search_start_offset < file_size:
         current_marker_offset = sector_data.find(START_MARKER, search_start_offset)
         if current_marker_offset == -1:
-            # log_queue.put(f"{log_prefix} DBG: Marker {START_MARKER.hex()} not found after offset {search_start_offset}.")
-            break # Marker not found in the rest of the file
+            break
 
-        # Calculate where the data block *should* start according to the marker logic
         potential_data_start = current_marker_offset + len(START_MARKER) + BYTES_TO_SKIP_AFTER_MARKER
 
-        # Check if there's enough space for the context check entries
         if potential_data_start + (N_CONTEXT_CHECK * VERTEX_STRUCT_SIZE) <= file_size:
             context_valid = True
-            # log_queue.put(f"{log_prefix} DBG: Marker found at {current_marker_offset}. Potential data start {potential_data_start}. Checking context...")
             for i in range(N_CONTEXT_CHECK):
                 entry_offset = potential_data_start + (i * VERTEX_STRUCT_SIZE)
                 if entry_offset + VERTEX_STRUCT_SIZE > file_size:
-                    # log_queue.put(f"{log_prefix} DBG: Context check failed: Not enough data for entry {i} at {entry_offset}.")
                     context_valid = False
-                    break # Not enough data left for this entry
+                    break
 
                 entry_bytes = sector_data[entry_offset : entry_offset + VERTEX_STRUCT_SIZE]
 
-                # Check if padding bytes are zero (basic heuristic)
                 if not all(entry_bytes[z] == 0x00 for z in EXPECTED_ZERO_BYTES_OFFSETS):
-                    # log_queue.put(f"{log_prefix} DBG: Context check failed: Entry {i} at {entry_offset} failed zero byte check (Bytes: {entry_bytes.hex()}).")
                     context_valid = False
-                    break # Found an entry where padding bytes aren't zero
+                    break
 
             if context_valid:
-                # log_queue.put(f"{log_prefix} DBG: Context check PASSED for {N_CONTEXT_CHECK} entries starting at {potential_data_start}.")
-                # Check if this potential start allows enough space for the *full* vertex data AND the preceding header
                 required_total_size_from_here = CHUNK2_HEADER_SIZE + (NUM_VERTICES * VERTEX_STRUCT_SIZE)
                 potential_header_start = potential_data_start - CHUNK2_HEADER_SIZE
                 if potential_header_start >= 0 and potential_header_start + required_total_size_from_here <= file_size:
                     log_queue.put(f"{log_prefix} Valid data block found via marker search. Vertex array starts at: {potential_data_start}")
                     found_valid_data_offset = potential_data_start
-                    break # Found a valid offset, stop searching
+                    break
                 else:
                     log_queue.put(f"{log_prefix} W: Marker context valid at {potential_data_start}, but not enough space for header+data (Need {required_total_size_from_here} from {potential_header_start}, File size {file_size}). Continuing search...")
-                    # This context was okay, but placement is bad, continue search
-            #else: # Context check failed for this marker instance, continue search
-                # log_queue.put(f"{log_prefix} DBG: Context check failed for marker at {current_marker_offset}. Continuing search...")
 
-        # Move search start past the current marker to find the next one
         search_start_offset = current_marker_offset + 1
 
     if found_valid_data_offset == -1:
@@ -106,37 +73,16 @@ def find_data_block_offset(sector_data, sector_filename, log_queue):
 
     return found_valid_data_offset
 
-
-# --- MODIFIED Function ---
 def extract_heightmap_from_sector(sector_data, sector_filename, log_queue):
-    """
-    Processes the raw binary data of a .sector file by dynamically finding the
-    data block offset using marker search, then reads the scale/offset header
-    preceding it and extracts 32x32 vertex height data.
-
-    Args:
-        sector_data (bytes): The binary content of the .sector file.
-        sector_filename (str): Original filename for logging and lookup.
-        log_queue (queue.Queue): Queue for sending log messages back to GUI.
-
-    Returns:
-        tuple: (numpy_array_float32, scale, offset) or (None, None, None) on error.
-               The numpy array is 32x32 float32 height data (original scale).
-    """
     log_prefix = f"  [{os.path.basename(sector_filename)}]"
 
-    # --- Find the offset dynamically ---
     vertex_data_array_offset = find_data_block_offset(sector_data, sector_filename, log_queue)
 
     if vertex_data_array_offset == -1:
-        # Error already logged by find_data_block_offset
         return None, None, None
-    # --- End dynamic offset finding ---
 
-    # Calculate the presumed header offset based on the found vertex data offset
     chunk2_header_offset = vertex_data_array_offset - CHUNK2_HEADER_SIZE
 
-    # --- Basic sanity checks (remain the same) ---
     if chunk2_header_offset < 0:
         log_queue.put(f"{log_prefix} Error: Calculated header offset ({chunk2_header_offset}) is invalid for dynamically found vertex offset {vertex_data_array_offset}.")
         return None, None, None
@@ -145,36 +91,28 @@ def extract_heightmap_from_sector(sector_data, sector_filename, log_queue):
     if chunk2_header_offset + required_total_size > len(sector_data):
           log_queue.put(f"{log_prefix} Error: Header offset {chunk2_header_offset} + required size {required_total_size} exceeds file data length ({len(sector_data)}) for dynamic offset {vertex_data_array_offset}.")
           return None, None, None
-    # --- End Sanity Checks ---
 
     log_queue.put(f"{log_prefix} Reading scale/offset header from calculated offset: {chunk2_header_offset}.")
 
     try:
-        # --- Read Scale/Offset Header (same as before) ---
         scale, offset = struct.unpack_from(CHUNK2_HEADER_FORMAT, sector_data, chunk2_header_offset)
         log_queue.put(f"{log_prefix} Read Scale={scale:.6f}, Offset={offset:.6f}")
 
-        # Handle potential zero scale (same as before)
-        if abs(scale) < 1e-9: # Use a small threshold for float comparison
+        if abs(scale) < 1e-9:
               log_queue.put(f"{log_prefix} Warning: Scale is near zero ({scale}). Heights will likely be uniform {offset}.")
-              # Avoid division by zero later if we were using inv_scale, but fine for current formula
-              # scale = 1e-9 # Prevent actual zero if needed elsewhere
 
         height_values_float = []
-        # --- Read Vertex Data (using the dynamically found offset) ---
-        for i in range(NUM_VERTICES): # 1024 times for 32x32 grid
+        for i in range(NUM_VERTICES):
             current_vertex_offset = vertex_data_array_offset + (i * VERTEX_STRUCT_SIZE)
-            # Unpack just the height_int (first 2 bytes, '<H')
-            height_int, = struct.unpack_from('<H', sector_data, current_vertex_offset) # Only need the height part
+            height_int, = struct.unpack_from('<H', sector_data, current_vertex_offset)
 
-            # --- Apply the loading formula (same as before) ---
             y_float = (float(height_int) * scale) + offset
             height_values_float.append(y_float)
 
-        # Create NumPy array with float32 dtype and reshape (same as before)
-        height_map_array = np.array(height_values_float, dtype=np.float32).reshape((GRID_SIZE, GRID_SIZE)) # 32x32
+        height_map_array = np.array(height_values_float, dtype=np.float32).reshape((GRID_SIZE, GRID_SIZE))
+        height_map_array = np.fliplr(height_map_array)
+        log_queue.put(f"{log_prefix} Horizontally flipped the heightmap.")
 
-        # Return the float array and the scale/offset read
         return height_map_array, scale, offset
 
     except struct.error as e:
@@ -182,27 +120,14 @@ def extract_heightmap_from_sector(sector_data, sector_filename, log_queue):
         return None, None, None
     except Exception as e:
         log_queue.put(f"{log_prefix} An unexpected error occurred during processing: {e}")
-        # log_queue.put(traceback.format_exc()) # Optional: Add full traceback for debugging
         return None, None, None
 
-
-# --- Main Worker Function ---
 def generate_heightmap(config, log_queue, progress_queue, cancel_event):
-    """
-    Main worker function. Scans archives, extracts sectors, generates PNGs.
-    Handles float heightmaps and directly converts to uint16 for visualization.
-    Communicates via queues and checks cancel_event.
-    """
     try:
         input_dir_path = config.get('input_dir', '.')
         output_dir_path = config.get('output_dir', '.')
         sector_suffix_type = config.get('sector_suffix_type', 'B0')
-        # --- Normalization Setting IS NO LONGER USED ---
-        # normalization_mode = config.get('normalization', 'global')
-        # log_queue.put(f"Using normalization mode: {normalization_mode}")
-        # ---
 
-        # Ensure output directory exists (code unchanged)
         if not os.path.exists(output_dir_path):
              try:
                  os.makedirs(output_dir_path, exist_ok=True)
@@ -216,7 +141,6 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
               progress_queue.put(-1.0)
               return
 
-        # Determine required suffix (code unchanged)
         if sector_suffix_type == "B0": required_suffix = "_b0.sector"
         elif sector_suffix_type == "D1": required_suffix = "_d1.sector"
         elif sector_suffix_type == "D2": required_suffix = "_d2.sector"
@@ -225,7 +149,6 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
              required_suffix = "_b0.sector"
         log_queue.put(f"Searching for sector files ending with: '{required_suffix}' (case-insensitive)")
 
-        # Find archives (code unchanged)
         all_archives = []
         try:
              log_queue.put(f"Scanning input directory: {input_dir_path}")
@@ -247,16 +170,10 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
         total_processed_count = 0
         total_failed_count = 0
         total_archives = len(all_archives)
-        progress_scale = 0.95 # Leave some room for final saving
+        progress_scale = 0.95
 
-        # --- Data storage ---
-        all_height_data = {} # Store {output_png_path: float_array}
-        # --- global min/max no longer needed for normalization ---
-        # global_min_height = float('inf')
-        # global_max_height = float('-inf')
-        # ---
+        all_height_data = {}
 
-        # --- Pass 1: Extract all float data ---
         log_queue.put("\n--- Pass 1: Extracting height data ---")
         for archive_idx, archive_filepath in enumerate(all_archives):
              if cancel_event.is_set():
@@ -277,7 +194,7 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
                      if sectors_found_in_archive == 0:
                          log_queue.put(f"  No sectors matching '{required_suffix}' found.")
                          if total_archives > 0:
-                             progress_queue.put(progress_scale * (archive_idx + 1) / total_archives * 0.5) # Halfway through pass 1
+                             progress_queue.put(progress_scale * (archive_idx + 1) / total_archives * 0.5)
                          continue
 
                      log_queue.put(f"  Found {sectors_found_in_archive} matching sectors. Extracting...")
@@ -289,33 +206,21 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
 
                          try:
                              sector_data = zf.read(file_info.filename)
-                             # --- Call the extraction function ---
                              height_map_array, scale, offset = extract_heightmap_from_sector(
                                  sector_data, file_info.filename, log_queue
                              )
-                             # ---
 
                              if height_map_array is not None:
-                                 # --- Store for Pass 2 ---
                                  base_name = os.path.basename(file_info.filename)
-                                 # Simplify suffix removal
                                  if base_name.lower().endswith(required_suffix.lower()):
                                     base_name = base_name[:-len(required_suffix)]
-                                 elif base_name.lower().endswith(".sector"): # Fallback just in case
+                                 elif base_name.lower().endswith(".sector"):
                                     base_name = base_name[:-len(".sector")]
 
                                  output_png_filename = f"{base_name}_height.png"
                                  output_png_path = os.path.join(output_dir_path, output_png_filename)
 
                                  all_height_data[output_png_path] = height_map_array
-
-                                 # --- No longer updating global min/max here ---
-                                 # if normalization_mode == 'global':
-                                 #     min_h = np.min(height_map_array)
-                                 #     max_h = np.max(height_map_array)
-                                 #     if np.isfinite(min_h) and min_h < global_min_height: global_min_height = min_h
-                                 #     if np.isfinite(max_h) and max_h > global_max_height: global_max_height = max_h
-                                 # ---
                                  processed_in_archive += 1
                              else:
                                  failed_in_archive += 1
@@ -331,12 +236,11 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
                              log_queue.put(traceback.format_exc())
                              failed_in_archive += 1
 
-                         # Update progress within Pass 1
                          if sectors_found_in_archive > 0:
                              current_archive_progress = (file_idx + 1) / sectors_found_in_archive
-                             overall_progress = progress_scale * (archive_idx + current_archive_progress) / total_archives * 0.5 # Max 50% in pass 1
+                             overall_progress = progress_scale * (archive_idx + current_archive_progress) / total_archives * 0.5
                              progress_queue.put(overall_progress)
-                         elif total_archives > 0: # Update even if no sectors found in this archive
+                         elif total_archives > 0:
                              overall_progress = progress_scale * (archive_idx + 1) / total_archives * 0.5
                              progress_queue.put(overall_progress)
 
@@ -356,7 +260,7 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
              finally:
                  log_queue.put(f"  Finished archive extraction. Processed: {processed_in_archive}, Failed/Skipped: {failed_in_archive}")
                  total_processed_count += processed_in_archive
-                 total_failed_count += failed_in_archive # Add file failures to total
+                 total_failed_count += failed_in_archive
 
         if cancel_event.is_set():
               log_queue.put("\n--- Processing Cancelled After Pass 1 ---")
@@ -365,10 +269,9 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
 
         if not all_height_data:
               log_queue.put("\n--- No height data successfully extracted. Finished ---")
-              progress_queue.put(1.0 if total_failed_count == 0 else -1.0) # Success only if no errors at all
+              progress_queue.put(1.0 if total_failed_count == 0 else -1.0)
               return
 
-        # --- Pass 2: Convert and Save PNGs (NO NORMALIZATION) ---
         log_queue.put(f"\n--- Pass 2: Converting and saving {len(all_height_data)} heightmaps (Direct Conversion) ---")
         log_queue.put("NOTE: Normalization skipped. Float heights converted directly to uint16.")
 
@@ -384,18 +287,8 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
 
               output_png_filename = os.path.basename(output_png_path)
               try:
-                  # --- REMOVED NORMALIZATION BLOCK ---
-
-                  # Handle potential NaNs before direct conversion
-                  # Replace NaNs with 0 before casting to uint16
                   float_array_filled = np.nan_to_num(float_array, nan=0.0)
-
-                  # Directly convert float array to uint16
-                  # WARNING: This may result in data loss or unexpected visuals
-                  # if float values are outside the 0-65535 range or negative.
                   img_array_uint16 = float_array_filled.astype(np.uint16)
-                  # --- End Conversion ---
-
                   img = Image.fromarray(img_array_uint16, mode='I;16')
                   img.save(output_png_path)
                   log_queue.put(f"  -> Saved: {output_png_filename} (Direct Conversion)")
@@ -405,13 +298,11 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
                   log_queue.put(traceback.format_exc())
                   save_failed_count += 1
 
-              # Update progress during Pass 2
-              overall_progress = progress_scale * (0.5 + ( (idx + 1) / num_to_save * 0.5) ) # Progress from 50% to 95%
+              overall_progress = progress_scale * (0.5 + ( (idx + 1) / num_to_save * 0.5) )
               progress_queue.put(overall_progress)
 
         total_failed_count += save_failed_count
 
-        # --- Processing Finished ---
         if cancel_event.is_set():
              log_queue.put("\n--- Processing Cancelled During Pass 2 ---")
         else:
@@ -419,34 +310,28 @@ def generate_heightmap(config, log_queue, progress_queue, cancel_event):
              log_queue.put(f"Total Sectors Matching '{required_suffix}' Successfully Processed & Saved: {saved_count}")
              log_queue.put(f"Total Extraction Failures (Marker Search/Read/File): {total_failed_count - save_failed_count}")
              log_queue.put(f"Total Save Failures: {save_failed_count}")
-             progress_queue.put(1.0) # Signal normal completion
+             progress_queue.put(1.0)
 
     except Exception as e:
          log_queue.put("\n--- FATAL ERROR in generate_heightmap ---")
          log_queue.put(f"Error: {e}")
          log_queue.put(traceback.format_exc())
-         progress_queue.put(-1.0) # Signal error
+         progress_queue.put(-1.0)
 
-
-# --- Example execution block (if needed for testing) ---
 if __name__ == '__main__':
     import queue
     import threading
 
-    # --- Configuration ---
     config = {
-        'input_dir': r'C:\Program Files (x86)\Steam\steamapps\common\Sacred 2 Gold\pak', # Example Path
-        'output_dir': r'.\heightmap_output_no_norm',  # Example Output Subdirectory
-        'sector_suffix_type': 'B0', # Or D1, D2
-        # 'normalization': 'global' # REMOVED - No longer used
+        'input_dir': r'C:\Program Files (x86)\Steam\steamapps\common\Sacred 2 Gold\pak',
+        'output_dir': r'.\heightmap_output_no_norm_flipped',
+        'sector_suffix_type': 'B0',
     }
 
-    # --- Setup Queues and Event ---
     log_queue = queue.Queue()
     progress_queue = queue.Queue()
     cancel_event = threading.Event()
 
-    # --- Log Printing Function ---
     def log_printer(stop_event):
         print("Log Printer Started")
         while not stop_event.is_set():
@@ -455,13 +340,11 @@ if __name__ == '__main__':
                 print(message)
                 log_queue.task_done()
             except queue.Empty:
-                # If the generator is done and the queue is empty, stop
                 if not generator_thread.is_alive() and log_queue.empty():
                     break
             except Exception as e:
                 print(f"Log printer error: {e}")
                 break
-        # Drain any remaining messages quickly after stop signal
         while not log_queue.empty():
              try:
                  print(log_queue.get_nowait())
@@ -470,55 +353,45 @@ if __name__ == '__main__':
                  break
         print("Log Printer Stopped")
 
-
-    # --- Start Generator ---
     print("Starting generator thread...")
     generator_thread = threading.Thread(target=generate_heightmap, args=(config, log_queue, progress_queue, cancel_event))
     generator_thread.start()
 
-    # --- Start Log Printer ---
     log_stop_event = threading.Event()
     printer_thread = threading.Thread(target=log_printer, args=(log_stop_event,))
     printer_thread.start()
 
-    # --- Monitor Progress ---
     final_progress = 0.0
     while generator_thread.is_alive():
         try:
-            # You could add a cancel condition here, e.g., input("Press Enter to cancel...\n")
-            # if user_input:
-            #    cancel_event.set()
-            #    print("Cancellation requested...")
-
             progress = progress_queue.get(timeout=0.5)
-            final_progress = progress # Store last known progress
+            final_progress = progress
             if progress == 1.0:
                 print("\nProgress: 100% (Complete signal)")
             elif progress < 0:
                  print("\nProgress: Error/Cancelled signal")
-                 if not cancel_event.is_set(): # If error signal but not cancelled by user
-                     cancel_event.set() # Ensure threads know to stop cleanly
+                 if not cancel_event.is_set():
+                     cancel_event.set()
             else:
-                 print(f"Progress: {progress*100:.1f}%", end='\r') # Overwrite line
+                 print(f"Progress: {progress*100:.1f}%", end='\r')
         except queue.Empty:
             pass
         except Exception as e:
              print(f"\nProgress queue error: {e}")
-             cancel_event.set() # Signal stop on error
+             cancel_event.set()
              break
-    print() # Newline after progress updates
+    print()
 
-    # --- Wait for Threads ---
     print("Waiting for generator thread to finish...")
-    generator_thread.join(timeout=10) # Add timeout
+    generator_thread.join(timeout=10)
     if generator_thread.is_alive():
         print("Generator thread timed out.")
-        cancel_event.set() # Force stop if stuck
+        cancel_event.set()
 
     print("Signaling log printer to stop...")
     log_stop_event.set()
     print("Waiting for log printer thread to finish...")
-    printer_thread.join(timeout=5) # Add timeout
+    printer_thread.join(timeout=5)
     if printer_thread.is_alive():
         print("Log printer thread timed out.")
 
